@@ -63,6 +63,9 @@ declarations in the IDE switches the pieces; nothing is cached across views.
 | 3 | puzzle-piece painter (notch/tab, ports, click) |
 | 4 | IDE context link + context strip |
 | 5 | one request per block click |
+| 6 | host wiring documented |
+| 7 | ports fit their piece; `[Attribute]` annotates instead of owning |
+| 8 | text wraps instead of being cut off; ports pack into rows |
 
 Later milestones should start with write-back: `EditIntent` is the agreed shape,
 and nothing yet applies it.
