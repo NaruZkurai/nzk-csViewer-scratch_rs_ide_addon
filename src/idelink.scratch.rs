@@ -175,6 +175,9 @@ pub enum Request {
     Reveal { file: String, line: i64 },
     /// Select/open a graph node.
     OpenNode(String),
+    /// Ask the IDE to highlight this line range (fragment-relative, 1-based,
+    /// inclusive). The host maps it to its source-pane highlight.
+    SelectRange { start: usize, end: usize },
 }
 
 /// The shape of a future edit — **data only, nothing applies it**.

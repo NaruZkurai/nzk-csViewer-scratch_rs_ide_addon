@@ -130,9 +130,33 @@ impl Theme {
     }
 }
 
-/// Every colour a piece needs, derived from the live `egui::Visuals` plus the
-/// theme's accents. Built once per frame; no statics, so a theme switch is a
-/// repaint away.
+/// The host IDE's source-pane palette.
+///
+/// The Scratch pane mirrors the editor it sits beside, so its background, text
+/// and token colours come from the *host's* syntax theme — not from egui's
+/// defaults, which is why the pane used to be a different grey than the IDE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PaletteSpec {
+    pub bg: Color32,
+    pub head_bg: Color32,
+    pub fg: Color32,
+    pub dim: Color32,
+    pub border: Color32,
+    pub accent: Color32,
+    pub keyword: Color32,
+    pub control: Color32,
+    pub ty: Color32,
+    pub iface: Color32,
+    pub string: Color32,
+    pub number: Color32,
+    pub preproc: Color32,
+    pub function: Color32,
+    pub variable: Color32,
+    pub op: Color32,
+}
+
+/// Every colour a piece needs. Built once per frame; no statics, so a theme
+/// switch is a repaint away.
 #[derive(Clone, Copy, Debug)]
 pub struct Palette {
     pub body: Color32,
@@ -146,9 +170,36 @@ pub struct Palette {
     pub border: Color32,
     pub trunk: Color32,
     pub theme: Theme,
+    /// Present when the host supplied its own palette; the accessors below
+    /// prefer it over the theme tables.
+    pub spec: Option<PaletteSpec>,
+}
+
+fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let f = |x: u8, y: u8| (x as f32 * (1.0 - t) + y as f32 * t).round() as u8;
+    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }
 
 impl Palette {
+    /// The palette the IDE itself uses: same background and same token colours.
+    /// Pieces are the IDE's head background so they read as surfaces on it.
+    pub fn from_spec(spec: PaletteSpec) -> Palette {
+        Palette {
+            body: spec.head_bg,
+            body_selected: mix(spec.head_bg, spec.accent, 0.28),
+            ink: spec.fg,
+            ink_dim: spec.dim,
+            port_bg: mix(spec.head_bg, spec.fg, 0.10),
+            port_ink: spec.dim,
+            chassis: spec.bg,
+            border: spec.border,
+            trunk: spec.border,
+            theme: Theme::NzkDarkPlus,
+            spec: Some(spec),
+        }
+    }
+
     pub fn new(theme: Theme, v: &egui::Visuals) -> Palette {
         Palette {
             body: v.widgets.noninteractive.bg_fill,
@@ -161,16 +212,48 @@ impl Palette {
             border: v.widgets.noninteractive.bg_stroke.color,
             trunk: v.widgets.noninteractive.bg_stroke.color,
             theme,
+            spec: None,
         }
     }
 
     pub fn accent(&self, kind: BlockKind) -> Color32 {
+        if let Some(s) = self.spec {
+            return match kind {
+                BlockKind::Namespace => s.iface,
+                BlockKind::Type => s.ty,
+                BlockKind::Method => s.function,
+                BlockKind::Property => s.variable,
+                BlockKind::Control => s.control,
+                BlockKind::Keyword => s.keyword,
+                BlockKind::Simple => s.dim,
+                BlockKind::Directive => s.preproc,
+            };
+        }
         self.theme.accent(kind)
+    }
+
+    /// The tint for a piece the IDE's highlight touches: the surface pulled
+    /// towards the kind's accent, not a new colour.
+    pub fn highlighted(&self, kind: BlockKind) -> Color32 {
+        mix(self.body, self.accent(kind), 0.20)
     }
 
     /// The colour for one word inside a piece. `None` from the theme means
     /// "ordinary text", which is the theme's ink.
     pub fn token(&self, kind: TokenKind) -> Color32 {
+        if let Some(s) = self.spec {
+            return match kind {
+                TokenKind::Plain => s.fg,
+                TokenKind::Punct => s.op,
+                TokenKind::Keyword => s.keyword,
+                TokenKind::Type => s.ty,
+                TokenKind::Method => s.function,
+                TokenKind::Variable => s.variable,
+                TokenKind::String => s.string,
+                TokenKind::Number => s.number,
+                TokenKind::Attribute => s.preproc,
+            };
+        }
         self.theme.token(kind).unwrap_or(self.ink)
     }
 }
@@ -178,24 +261,96 @@ impl Palette {
 /// GUI-local state: what the user changed, nothing derived.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GuiState {
-    /// The selected block as a child path (see [`ScratchDoc::block_at`]).
-    pub selected: Option<Vec<usize>>,
+    /// The selected blocks as child paths (see [`ScratchDoc::block_at`]).
+    /// More than one, because `Ctrl+click`/`Shift+click` builds a set and
+    /// `Ctrl+C` copies every selected piece.
+    pub selected: Vec<Vec<usize>>,
     /// Paint the typed port pills. On by default: the ports are the point.
     pub show_ports: bool,
-    /// The host's theme; the painter takes its accents from here.
+    /// The host's theme; the painter takes its accents from here when no
+    /// [`PaletteSpec`] was supplied.
     pub theme: Theme,
+    /// The host IDE's own palette, when it has one. Preferred over the theme.
+    pub spec: Option<PaletteSpec>,
+    /// The IDE's highlighted line range, **fragment-relative, 1-based and
+    /// inclusive**. Any block it touches is highlighted whole — a partial
+    /// overlap still highlights the whole piece.
+    pub highlight: Option<(usize, usize)>,
+    /// Modifier state captured at pointer-press, so a Ctrl+click adds to the
+    /// selection even if the key is released before egui processes the click.
+    pub press_additive: bool,
 }
 
 impl GuiState {
     pub fn new() -> GuiState {
-        GuiState { selected: None, show_ports: true, theme: Theme::default() }
+        GuiState {
+            selected: Vec::new(),
+            show_ports: true,
+            theme: Theme::default(),
+            spec: None,
+            highlight: None,
+            press_additive: false,
+        }
+    }
+
+    /// Is `path` part of the current selection?
+    pub fn is_selected(&self, path: &[usize]) -> bool {
+        self.selected.iter().any(|p| p.as_slice() == path)
+    }
+
+    /// Add/remove `path` (an additive click) or replace the selection.
+    pub fn select(&mut self, path: &[usize], additive: bool) {
+        if additive {
+            if self.is_selected(path) {
+                self.selected.retain(|p| p.as_slice() != path);
+            } else {
+                self.selected.push(path.to_vec());
+            }
+        } else {
+            self.selected = vec![path.to_vec()];
+        }
+    }
+
+    /// The selected blocks as C# text, in selection order.
+    pub fn copy_text(&self, doc: &ScratchDoc) -> String {
+        self.selected
+            .iter()
+            .filter_map(|p| doc.block_at(p))
+            .map(|b| b.source(0))
+            .collect::<Vec<_>>()
+            .join("\n\n")
     }
 }
 
 /// Paint the whole document and return the requests the user's clicks made.
 pub fn ui(ui: &mut egui::Ui, doc: &ScratchDoc, state: &mut GuiState) -> Vec<Request> {
     let mut requests = Vec::new();
-    let palette = Palette::new(state.theme, ui.visuals());
+    let palette = match state.spec {
+        Some(spec) => Palette::from_spec(spec),
+        None => Palette::new(state.theme, ui.visuals()),
+    };
+
+    // The pane is the IDE's surface: paint its background and text with the
+    // host's own colours instead of egui's defaults.
+    ui.painter().rect_filled(ui.max_rect(), CornerRadius::ZERO, palette.chassis);
+    ui.style_mut().visuals.override_text_color = Some(palette.ink);
+    ui.style_mut().visuals.panel_fill = palette.chassis;
+
+    // Ctrl/Cmd+C copies the selected pieces as C#, terminators included.
+    // egui-winit delivers the platform shortcut as `Event::Copy`, so both the
+    // canonical event and a raw Ctrl+C key are accepted.
+    let copy_hit = ui.input(|i| {
+        i.events
+            .iter()
+            .any(|e| matches!(e, egui::Event::Copy | egui::Event::Cut))
+            || ((i.modifiers.command || i.modifiers.ctrl) && i.key_pressed(egui::Key::C))
+    });
+    if copy_hit && !state.selected.is_empty() {
+        let text = state.copy_text(doc);
+        if !text.is_empty() {
+            ui.ctx().copy_text(text);
+        }
+    }
 
     header(ui, doc, state);
 
@@ -239,6 +394,9 @@ fn header(ui: &mut egui::Ui, doc: &ScratchDoc, state: &mut GuiState) {
     ui.horizontal(|ui| {
         ui.checkbox(&mut state.show_ports, "ports");
         ui.weak(if doc.from_source_pane { "· from the source pane" } else { "· from the graph" });
+        if !state.selected.is_empty() {
+            ui.weak(format!("· {} selected — Ctrl+C copies", state.selected.len()));
+        }
     });
 }
 
@@ -337,9 +495,13 @@ fn paint_block(
     let (row, resp) = ui.allocate_exact_size(Vec2::new(avail, height + ROW_GAP), Sense::click());
     let piece = Rect::from_min_size(row.min + Vec2::new(indent, 0.0), Vec2::new(width, height));
 
-    let selected = state.selected.as_deref() == Some(path.as_slice());
-    let accent = palette.accent(block.kind);
-    paint_piece(ui, piece, accent, palette, selected);
+    let selected = state.is_selected(path);
+    // The IDE's highlight selects whole pieces: a block that only *partly*
+    // overlaps the range is still highlighted in full.
+    let highlighted = state
+        .highlight
+        .is_some_and(|(a, b)| block.line <= b && block.end_line >= a);
+    paint_piece(ui, piece, block.kind, palette, selected, highlighted);
 
     let text_pos = Pos2::new(piece.left() + TEXT_X, piece.top() + PAD * 0.6);
     let text_h = galley.size().y;
@@ -369,11 +531,21 @@ fn paint_block(
         if block.closed { "" } else { "  (unclosed brace)" }
     );
     let resp = resp.on_hover_text(hover);
+    if resp.hovered() && ui.input(|i| i.pointer.primary_pressed()) {
+        state.press_additive =
+            ui.input(|i| i.modifiers.shift || i.modifiers.command || i.modifiers.ctrl);
+    }
     if resp.clicked() {
-        state.selected = Some(path.clone());
+        state.select(path, state.press_additive);
         // One action per click: a block belongs to a graph node, so the node is
         // the real target. `Reveal` is the fallback for a document with no node
         // (a file view), where a file+line is all the host can be told.
+        // Ask the IDE to highlight the block's whole span, including when the
+        // click landed on one line of a multi-line piece.
+        requests.push(Request::SelectRange {
+            start: block.line,
+            end: block.end_line,
+        });
         if !doc.node_id.is_empty() {
             requests.push(Request::OpenNode(doc.node_id.clone()));
         } else if !doc.location.is_empty() {
@@ -415,10 +587,24 @@ fn paint_block(
 }
 
 /// The piece itself: theme surface, a kind stripe on the left, a notch and a tab.
-fn paint_piece(ui: &mut egui::Ui, rect: Rect, accent: Color32, palette: &Palette, selected: bool) {
+fn paint_piece(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    kind: BlockKind,
+    palette: &Palette,
+    selected: bool,
+    highlighted: bool,
+) {
     let painter = ui.painter();
     let radius = CornerRadius::same(7);
-    let fill = if selected { palette.body_selected } else { palette.body };
+    let accent = palette.accent(kind);
+    let fill = if selected {
+        palette.body_selected
+    } else if highlighted {
+        palette.highlighted(kind)
+    } else {
+        palette.body
+    };
 
     // Tab first, so the body's own rounded corner overlaps it cleanly.
     let tab = Rect::from_min_size(
@@ -619,6 +805,48 @@ mod tests {
             assert_eq!(colours.len(), kinds.len(), "each word kind is distinct");
             assert_eq!(p.token(TokenKind::Plain), p.ink, "plain text is the theme ink");
         }
+    }
+
+    /// Ctrl+C must put the selected pieces on the clipboard as C#.
+    #[test]
+    fn ctrl_c_copies_the_selected_blocks() {
+        let doc = doc("void A() { Go(); }\nvoid B() { Stop(); }");
+        let mut state = GuiState::new();
+        state.selected = vec![vec![0], vec![1]];
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input.focused = true;
+        input.events.push(egui::Event::Copy);
+        let mut out = ctx.run_ui(input, |ui| {
+            let _ = super::ui(ui, &doc, &mut state);
+        });
+        let copied = out
+            .platform_output
+            .commands
+            .iter()
+            .find_map(|c| match c {
+                egui::OutputCommand::CopyText(t) => Some(t.clone()),
+                _ => None,
+            })
+            .expect("Ctrl+C must emit CopyText");
+        out.textures_delta.clear();
+        assert!(copied.contains("void A () {"), "copied: {copied}");
+        assert!(copied.contains("Go();"), "terminators survive the copy");
+        assert!(copied.contains("void B () {"));
+        assert!(copied.contains("Stop();"));
+    }
+
+    #[test]
+    fn additive_clicks_build_a_selection_set() {
+        let mut state = GuiState::new();
+        state.select(&[0], false);
+        assert!(state.is_selected(&[0]));
+        state.select(&[1], true);
+        assert!(state.is_selected(&[0]) && state.is_selected(&[1]));
+        state.select(&[0], true);
+        assert!(!state.is_selected(&[0]), "a second additive click removes it");
+        state.select(&[2], false);
+        assert_eq!(state.selected, vec![vec![2]], "a plain click replaces the set");
     }
 
     #[test]

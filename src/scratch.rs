@@ -104,6 +104,32 @@ impl Port {
     }
 }
 
+/// How a statement ended in the source, so a copy can be re-emitted faithfully
+/// (the splitter consumes the delimiter, so it has to be remembered).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Term {
+    #[default]
+    None,
+    Semi,
+    Comma,
+    /// A `case X:` / `default:` label.
+    Colon,
+    /// A block: the delimiter was `{ … }`, emitted by the children.
+    Brace,
+}
+
+impl Term {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Term::None => "",
+            Term::Semi => ";",
+            Term::Comma => ",",
+            Term::Colon => ":",
+            Term::Brace => "",
+        }
+    }
+}
+
 /// One puzzle piece.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Block {
@@ -124,8 +150,12 @@ pub struct Block {
     pub children: Vec<Block>,
     /// 1-based line within the parsed fragment where this block starts.
     pub line: usize,
+    /// 1-based line where it ends (same as `line` for a one-line statement).
+    pub end_line: usize,
     /// False when the block's `{` was never matched (an honest, reported defect).
     pub closed: bool,
+    /// What ended the statement in the source (`;`, `,`, `:` or `{ … }`).
+    pub terminator: Term,
 }
 
 impl Block {
@@ -140,6 +170,32 @@ impl Block {
         if !self.body.is_empty() {
             out.push(' ');
             out.push_str(&self.body);
+        }
+        out
+    }
+
+    /// Reconstruct this block (and its children) as C# text, for the clipboard.
+    ///
+    /// The splitter drops delimiters, so the remembered [`Term`] is what makes
+    /// a copied statement valid again. Indentation is four spaces per level.
+    pub fn source(&self, indent: usize) -> String {
+        let pad = "    ".repeat(indent);
+        let mut out = format!("{pad}{}", self.text());
+        match self.terminator {
+            Term::Brace => {
+                if self.children.is_empty() {
+                    out.push_str(" { }");
+                } else {
+                    out.push_str(" {\n");
+                    for child in &self.children {
+                        out.push_str(&child.source(indent + 1));
+                        out.push('\n');
+                    }
+                    out.push_str(&pad);
+                    out.push('}');
+                }
+            }
+            other => out.push_str(other.as_str()),
         }
         out
     }
@@ -380,7 +436,7 @@ impl Scan {
             let mut text = String::new();
             self.skip_trivia(&mut text);
             if self.peek().is_none() {
-                self.push_leaf(out, sig, &text);
+                self.push_leaf(out, sig, &text, Term::None);
                 if !text.trim().is_empty() && top {
                     warnings.push(format!(
                         "line {}: text after the last statement has no `;` or `{{`",
@@ -395,7 +451,7 @@ impl Scan {
                     warnings.push(format!("line {}: unmatched `}}`", self.line));
                     continue;
                 }
-                self.push_leaf(out, sig, &text);
+                self.push_leaf(out, sig, &text, Term::None);
                 return true;
             }
 
@@ -411,7 +467,15 @@ impl Scan {
                     }
                     dir.push(c);
                 }
-                out.push(make_block(dir.trim(), Vec::new(), true, start_line, sig));
+                out.push(make_block(
+                    dir.trim(),
+                    Vec::new(),
+                    true,
+                    start_line,
+                    self.line,
+                    sig,
+                    Term::None,
+                ));
                 continue;
             }
 
@@ -420,7 +484,7 @@ impl Scan {
             let mut brack = 0i32;
             loop {
                 let Some(c) = self.peek() else {
-                    self.push_leaf(out, sig, &text);
+                    self.push_leaf(out, sig, &text, Term::None);
                     return false;
                 };
                 match c {
@@ -458,11 +522,19 @@ impl Scan {
                                 "line {start_line}: `{{` opened here is never closed"
                             ));
                         }
-                        out.push(make_block(&header, children, closed, start_line, sig));
+                        out.push(make_block(
+                            &header,
+                            children,
+                            closed,
+                            start_line,
+                            self.line,
+                            sig,
+                            Term::Brace,
+                        ));
                         break;
                     }
                     '}' if paren <= 0 && brack <= 0 => {
-                        self.push_leaf(out, sig, &text);
+                        self.push_leaf(out, sig, &text, Term::None);
                         self.bump();
                         if top {
                             warnings.push(format!("line {}: unmatched `}}`", self.line));
@@ -475,17 +547,17 @@ impl Scan {
                     // of the call on the next line.
                     ':' if paren <= 0 && brack <= 0 && is_case_label(&text) => {
                         self.bump();
-                        self.push_leaf(out, sig, &text);
+                        self.push_leaf(out, sig, &text, Term::Colon);
                         break;
                     }
                     ';' if paren <= 0 && brack <= 0 => {
                         self.bump();
-                        self.push_leaf(out, sig, &text);
+                        self.push_leaf(out, sig, &text, Term::Semi);
                         break;
                     }
                     ',' if comma_ends_statement && paren <= 0 && brack <= 0 => {
                         self.bump();
-                        self.push_leaf(out, sig, &text);
+                        self.push_leaf(out, sig, &text, Term::Comma);
                         break;
                     }
                     '/' if matches!(self.at(1), Some('/') | Some('*')) => {
@@ -497,17 +569,25 @@ impl Scan {
         }
     }
 
-    fn push_leaf(&self, out: &mut Vec<Block>, sig: &Signature, text: &str) {
+    fn push_leaf(&self, out: &mut Vec<Block>, sig: &Signature, text: &str, term: Term) {
         let t = text.trim();
         if t.is_empty() {
             return;
         }
-        out.push(make_block(t, Vec::new(), true, self.line, sig));
+        out.push(make_block(t, Vec::new(), true, self.line, self.line, sig, term));
     }
 }
 
 /// Build one block from its header text (and already-parsed children).
-fn make_block(header: &str, children: Vec<Block>, closed: bool, line: usize, sig: &Signature) -> Block {
+fn make_block(
+    header: &str,
+    children: Vec<Block>,
+    closed: bool,
+    line: usize,
+    end_line: usize,
+    sig: &Signature,
+    terminator: Term,
+) -> Block {
     // `[SerializeField] private int count` is a field with an attribute, so the
     // attribute run is peeled off BEFORE the construct is classified and its
     // ports read. It is still shown, just not allowed to own the block.
@@ -518,7 +598,18 @@ fn make_block(header: &str, children: Vec<Block>, closed: bool, line: usize, sig
     if kind == BlockKind::Simple && children.iter().any(|c| c.kind == BlockKind::Property) {
         kind = BlockKind::Property;
         let ports = Vec::new();
-        return Block { kind, attrs, head, body, ports, children, line, closed };
+        return Block {
+            kind,
+            attrs,
+            head,
+            body,
+            ports,
+            children,
+            line,
+            end_line,
+            closed,
+            terminator,
+        };
     }
     let mut ports = ports_for(kind, &head, &body, sig);
     let mut children = children;
@@ -529,7 +620,7 @@ fn make_block(header: &str, children: Vec<Block>, closed: bool, line: usize, sig
         }
         ports.clear();
     }
-    Block { kind, attrs, head, body, ports, children, line, closed }
+    Block { kind, attrs, head, body, ports, children, line, end_line, closed, terminator }
 }
 
 /// Peel leading `[ … ]` attribute runs off a declaration header.
@@ -1366,6 +1457,29 @@ int F(bool b) {
         assert_eq!(kind_at("0.25f"), TokenKind::Number);
         assert_eq!(kind_at("\"a;b\""), TokenKind::String);
         assert_eq!(kind_at("var"), TokenKind::Keyword);
+    }
+
+    #[test]
+    fn source_round_trips_terminators_and_braces() {
+        let p = parse(
+            "void A() {\n  int x = 1;\n  if (x > 0) { Go(); }\n  return;\n}",
+            &Signature::default(),
+        );
+        let src = p.blocks[0].source(0);
+        assert!(src.starts_with("void A () {"), "signature + opening brace: {src}");
+        assert!(src.contains("    int x = 1;"), "a statement keeps its semicolon");
+        assert!(src.contains("    if (x > 0) {"), "a control block reopens its brace");
+        assert!(src.contains("        Go();"), "children are indented and terminated");
+        assert!(src.contains("    return;"));
+        assert!(src.ends_with('}'));
+    }
+
+    #[test]
+    fn an_enum_member_keeps_its_comma() {
+        let p = parse("enum K { A = 0, B = 1 }", &Signature::default());
+        let src = p.blocks[0].source(0);
+        assert!(src.contains("A = 0,"), "{src}");
+        assert!(src.contains("B = 1"), "{src}");
     }
 
     #[test]
