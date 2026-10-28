@@ -42,7 +42,7 @@ use egui::{
 };
 
 use crate::idelink_scratch::{Request, ScratchDoc};
-use crate::scratch::{Block, BlockKind};
+use crate::scratch::{tokens, Block, BlockKind, TokenKind};
 
 /// Room the next piece leaves for this one's tab.
 const ROW_GAP: f32 = 9.0;
@@ -79,6 +79,30 @@ pub enum Theme {
 impl Theme {
     fn rgb(c: u32) -> Color32 {
         Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
+    }
+
+    /// The editor colour for one word, from the theme's syntax palette.
+    ///
+    /// `Plain`/`Punct` fall back to the theme's text colour at the call site.
+    pub fn token(self, kind: TokenKind) -> Option<Color32> {
+        let c = match (self, kind) {
+            (_, TokenKind::Plain | TokenKind::Punct) => return None,
+            (Theme::NzkDarkPlus, TokenKind::Keyword) => 0x569cd6,
+            (Theme::NzkDarkPlus, TokenKind::Type) => 0x4ec9b0,
+            (Theme::NzkDarkPlus, TokenKind::Method) => 0xdcdcaa,
+            (Theme::NzkDarkPlus, TokenKind::Variable) => 0x9cdcfe,
+            (Theme::NzkDarkPlus, TokenKind::String) => 0xce9178,
+            (Theme::NzkDarkPlus, TokenKind::Number) => 0xb5cea8,
+            (Theme::NzkDarkPlus, TokenKind::Attribute) => 0xd7ba7d,
+            (Theme::DarkV1, TokenKind::Keyword) => 0x86aaf9,
+            (Theme::DarkV1, TokenKind::Type) => 0x42c3d0,
+            (Theme::DarkV1, TokenKind::Method) => 0xfa903e,
+            (Theme::DarkV1, TokenKind::Variable) => 0x9db8f0,
+            (Theme::DarkV1, TokenKind::String) => 0xc8b6ff,
+            (Theme::DarkV1, TokenKind::Number) => 0xffc46b,
+            (Theme::DarkV1, TokenKind::Attribute) => 0xe57300,
+        };
+        Some(Theme::rgb(c))
     }
 
     /// The stripe colour for one block kind, taken from the theme's own node
@@ -142,6 +166,12 @@ impl Palette {
 
     pub fn accent(&self, kind: BlockKind) -> Color32 {
         self.theme.accent(kind)
+    }
+
+    /// The colour for one word inside a piece. `None` from the theme means
+    /// "ordinary text", which is the theme's ink.
+    pub fn token(&self, kind: TokenKind) -> Color32 {
+        self.theme.token(kind).unwrap_or(self.ink)
     }
 }
 
@@ -272,8 +302,24 @@ fn paint_block(
     let max_w = (avail - indent).max(120.0);
     let text_max = text_max_width(avail, indent);
 
+    // VSCode-style: every word carries its own colour. The tokens cover the
+    // whole text (whitespace included), so nothing is dropped between sections.
+    let text = block.text();
     let font = FontId::monospace(BODY_FONT);
-    let galley = ui.painter().layout(block.text(), font, palette.ink, text_max);
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = text_max;
+    for span in tokens(&text) {
+        job.append(
+            &text[span.start..span.end],
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color: palette.token(span.kind),
+                ..Default::default()
+            },
+        );
+    }
+    let galley = ui.painter().layout_job(job);
     let text_w = galley.size().x;
 
     let port_sizes: Vec<Vec2> = if state.show_ports {
@@ -550,6 +596,28 @@ mod tests {
             accents.sort();
             accents.dedup();
             assert_eq!(accents.len(), kinds.len(), "accents must identify the kind");
+        }
+    }
+
+    /// Every word kind has a colour and they are not all the same, per theme.
+    #[test]
+    fn every_token_kind_is_coloured_per_theme() {
+        for theme in [Theme::NzkDarkPlus, Theme::DarkV1] {
+            let p = Palette::new(theme, &egui::Visuals::dark());
+            let kinds = [
+                TokenKind::Keyword,
+                TokenKind::Type,
+                TokenKind::Method,
+                TokenKind::Variable,
+                TokenKind::String,
+                TokenKind::Number,
+                TokenKind::Attribute,
+            ];
+            let mut colours: Vec<[u8; 4]> = kinds.iter().map(|k| p.token(*k).to_array()).collect();
+            colours.sort();
+            colours.dedup();
+            assert_eq!(colours.len(), kinds.len(), "each word kind is distinct");
+            assert_eq!(p.token(TokenKind::Plain), p.ink, "plain text is the theme ink");
         }
     }
 

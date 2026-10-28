@@ -1331,8 +1331,244 @@ int F(bool b) {
     }
 
     #[test]
+    fn tokens_cover_every_byte_and_classify_words() {
+        let text = "[UnityEngine.Tooltip(\"x\")] public UnityEngine.Transform ResolveAnimated(int n) { return null; }";
+        let spans = tokens(text);
+        assert_eq!(spans.first().unwrap().start, 0);
+        assert_eq!(spans.last().unwrap().end, text.len(), "no gap at the end");
+        for pair in spans.windows(2) {
+            assert_eq!(pair[0].end, pair[1].start, "spans are contiguous");
+        }
+        let kind_at = |needle: &str| {
+            let i = text.find(needle).expect(needle);
+            spans.iter().find(|s| s.start <= i && i < s.end).expect("span").kind
+        };
+        assert_eq!(kind_at("[UnityEngine"), TokenKind::Attribute);
+        assert_eq!(kind_at("public"), TokenKind::Keyword);
+        assert_eq!(kind_at("Transform"), TokenKind::Type);
+        assert_eq!(kind_at("ResolveAnimated"), TokenKind::Method);
+        assert_eq!(kind_at("int"), TokenKind::Keyword);
+        assert_eq!(kind_at("null"), TokenKind::Keyword);
+        // The only literal in this text sits inside the attribute run, so it is
+        // coloured as part of it — the attribute span is one token.
+        assert_eq!(kind_at("\"x\""), TokenKind::Attribute);
+        assert_eq!(kind_at("{"), TokenKind::Punct);
+    }
+
+    #[test]
+    fn numbers_and_strings_are_their_own_tokens() {
+        let text = "var x = 0.25f; var s = \"a;b\";";
+        let spans = tokens(text);
+        let kind_at = |needle: &str| {
+            let i = text.find(needle).expect(needle);
+            spans.iter().find(|s| s.start <= i && i < s.end).expect("span").kind
+        };
+        assert_eq!(kind_at("0.25f"), TokenKind::Number);
+        assert_eq!(kind_at("\"a;b\""), TokenKind::String);
+        assert_eq!(kind_at("var"), TokenKind::Keyword);
+    }
+
+    #[test]
     fn unbalanced_close_is_reported() {
         let p = parse("void A() { }\n}", &Signature::default());
         assert!(p.warnings.iter().any(|w| w.contains("unmatched")));
     }
 }
+
+// ---------------------------------------------------------------------------
+// token colours (VSCode-style, for the painter)
+// ---------------------------------------------------------------------------
+
+/// What a word *is*, so the painter can colour it like an editor would.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TokenKind {
+    /// Whitespace and anything unclassified.
+    Plain,
+    /// `if`, `return`, `public`, `int`, `true`, …
+    Keyword,
+    /// A name that starts with a capital: `UnityEngine`, `NzkSps2AnimTarget`.
+    Type,
+    /// A name immediately followed by `(`.
+    Method,
+    /// Everything else with a name: locals, parameters, fields.
+    Variable,
+    /// A string or character literal.
+    String,
+    /// A numeric literal.
+    Number,
+    /// A `[ … ]` attribute run.
+    Attribute,
+    /// Brackets, operators, punctuation.
+    Punct,
+}
+
+/// A byte range of the block text with one token kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+    pub kind: TokenKind,
+}
+
+/// C# words that are coloured as keywords (control flow, modifiers, built-in
+/// types and the literals). Not a grammar — a colouring table.
+const KEYWORDS: &[&str] = &[
+    "abstract", "as", "async", "await", "base", "bool", "break", "byte", "case", "catch",
+    "char", "checked", "class", "const", "continue", "decimal", "default", "delegate", "do",
+    "double", "else", "enum", "event", "explicit", "extern", "false", "finally", "fixed",
+    "float", "for", "foreach", "get", "goto", "if", "implicit", "in", "init", "int",
+    "interface", "internal", "is", "lock", "long", "namespace", "new", "null", "object",
+    "operator", "out", "override", "params", "partial", "private", "protected", "public",
+    "readonly", "record", "ref", "return", "sbyte", "sealed", "set", "short", "sizeof",
+    "stackalloc", "static", "string", "struct", "switch", "this", "throw", "true", "try",
+    "typeof", "uint", "ulong", "unchecked", "unsafe", "ushort", "using", "var", "virtual",
+    "void", "volatile", "while", "yield",
+];
+
+/// Split `text` into contiguous spans covering every byte, so a painter can
+/// colour each word and append them without losing the whitespace between them.
+pub fn tokens(text: &str) -> Vec<Span> {
+    let b = text.as_bytes();
+    let n = b.len();
+    let mut out: Vec<Span> = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        let start = i;
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            while i < n && b[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            out.push(Span { start, end: i, kind: TokenKind::Plain });
+        } else if c == b'[' {
+            i = attribute_end(b, i);
+            out.push(Span { start, end: i, kind: TokenKind::Attribute });
+        } else if is_string_start(b, i) {
+            i = string_end(b, i);
+            out.push(Span { start, end: i, kind: TokenKind::String });
+        } else if c.is_ascii_digit() {
+            i += 1;
+            while i < n
+                && (b[i].is_ascii_alphanumeric() || b[i] == b'.' || b[i] == b'_')
+            {
+                i += 1;
+            }
+            out.push(Span { start, end: i, kind: TokenKind::Number });
+        } else if is_ident_start(c) {
+            i += 1;
+            while i < n && is_ident_continue(b[i]) {
+                i += 1;
+            }
+            let word = &text[start..i];
+            let kind = if KEYWORDS.contains(&word) {
+                TokenKind::Keyword
+            } else {
+                let mut j = i;
+                while j < n && b[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if b.get(j) == Some(&b'(') {
+                    TokenKind::Method
+                } else if word.chars().next().is_some_and(char::is_uppercase) {
+                    TokenKind::Type
+                } else {
+                    TokenKind::Variable
+                }
+            };
+            out.push(Span { start, end: i, kind });
+        } else {
+            i += 1;
+            out.push(Span { start, end: i, kind: TokenKind::Punct });
+        }
+    }
+    out
+}
+
+fn is_ident_start(c: u8) -> bool {
+    c.is_ascii_alphabetic() || c == b'_' || c == b'@'
+}
+
+fn is_ident_continue(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
+}
+
+fn is_string_start(b: &[u8], i: usize) -> bool {
+    match b[i] {
+        b'"' | b'\'' => true,
+        b'@' => matches!(b.get(i + 1), Some(b'"')),
+        b'$' => matches!(b.get(i + 1), Some(b'"') | Some(b'@')),
+        _ => false,
+    }
+}
+
+fn string_end(b: &[u8], start: usize) -> usize {
+    let n = b.len();
+    let mut i = start;
+    while i < n && (b[i] == b'$' || b[i] == b'@') {
+        i += 1;
+    }
+    if i < n && (b[i] == b'"' || b[i] == b'\'') {
+        let q = b[i];
+        // Count the opening run: 2 = empty literal, 3+ = raw string.
+        let mut run = 0usize;
+        while i < n && b[i] == q {
+            run += 1;
+            i += 1;
+        }
+        if q == b'"' && run >= 3 {
+            let mut r = 0usize;
+            while i < n {
+                if b[i] == b'"' {
+                    r += 1;
+                    if r == run {
+                        return i + 1;
+                    }
+                } else {
+                    r = 0;
+                }
+                i += 1;
+            }
+            return n;
+        }
+        if q == b'"' && run == 2 {
+            return i;
+        }
+        while i < n {
+            if b[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if b[i] == q {
+                return i + 1;
+            }
+            i += 1;
+        }
+        return n;
+    }
+    i
+}
+
+fn attribute_end(b: &[u8], start: usize) -> usize {
+    let n = b.len();
+    let mut depth = 0i32;
+    let mut i = start;
+    while i < n {
+        match b[i] {
+            b'"' => {
+                i = string_end(b, i);
+                continue;
+            }
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return i + 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    n
+}
+
