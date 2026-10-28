@@ -16,3 +16,6 @@
 
 #[path = "scratch.rs"]
 pub mod scratch;
+
+#[path = "idelink.scratch.rs"]
+pub mod idelink_scratch;
