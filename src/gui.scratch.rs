@@ -213,12 +213,14 @@ fn paint_block(
     let resp = resp.on_hover_text(hover);
     if resp.clicked() {
         state.selected = Some(path.clone());
+        // One action per click: a block belongs to a graph node, so the node is
+        // the real target. `Reveal` is the fallback for a document with no node
+        // (a file view), where a file+line is all the host can be told.
         if !doc.node_id.is_empty() {
             requests.push(Request::OpenNode(doc.node_id.clone()));
-        }
-        if !doc.location.is_empty() {
-            // The doc's `line` is the declaration's first line; the block's line
-            // is 1-based *within the fragment*.
+        } else if !doc.location.is_empty() {
+            // `doc.line` is the declaration's first line; the block's line is
+            // 1-based *within the fragment*.
             let line = doc.line.max(1) + block.line as i64 - 1;
             let file = doc
                 .location
