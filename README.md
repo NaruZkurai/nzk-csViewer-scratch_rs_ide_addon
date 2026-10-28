@@ -66,6 +66,7 @@ declarations in the IDE switches the pieces; nothing is cached across views.
 | 6 | host wiring documented |
 | 7 | ports fit their piece; `[Attribute]` annotates instead of owning |
 | 8 | text wraps instead of being cut off; ports pack into rows |
+| 10 | kinds fixed against real files: empty strings, enums, accessors, directives, case labels |
 
 Later milestones should start with write-back: `EditIntent` is the agreed shape,
 and nothing yet applies it.
