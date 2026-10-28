@@ -28,6 +28,16 @@ typed `body` remainder, typed `ports`, and nested `children` for its braces.
 Types are `Option<String>`: `None` means *unknown*, and is drawn `?` — never
 guessed.
 
+A leading `[Attribute]` run is **its own piece** (`BlockKind::Attribute`), not
+glued to the declaration. A field with a three-line `[Tooltip]` is therefore an
+attribute piece plus a short field piece, and a class with two attributes is
+three pieces instead of one wide block wrapping across the pane. That is the
+"one block per concept" rule: attributes annotate, they do not own.
+
+Colours come from the tokenizer addon (`def2mcpfnnumber::syntax`) — the same
+table the IDE uses. `[`/`]` are punctuation, the attribute's type/call/string
+keep their normal colours, and a `namespace` is a keyword, never a comment.
+
 ## Tests
 
 ```sh
@@ -67,6 +77,8 @@ declarations in the IDE switches the pieces; nothing is cached across views.
 | 7 | ports fit their piece; `[Attribute]` annotates instead of owning |
 | 8 | text wraps instead of being cut off; ports pack into rows |
 | 10 | kinds fixed against real files: empty strings, enums, accessors, directives, case labels |
+| 13-15 | per-word token colours from the shared tokenizer; the host IDE palette; Ctrl+C; two-way highlight |
+| 16 | attributes are their own pieces (one concept per block); the shared tokenizer is the tokenizer addon; shapers cached per piece so a repaint does not re-shape every block |
 
 Later milestones should start with write-back: `EditIntent` is the agreed shape,
 and nothing yet applies it.

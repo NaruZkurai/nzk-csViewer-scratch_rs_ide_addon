@@ -12,6 +12,9 @@ repository = "https://github.com/naruzkurai/scratch_rs_ide_addon"
 # `idelink.nzkide.rs` (IDE context in) — both pure data.
 [dependencies]
 egui = { version = "0.37", default-features = false }
+# The shared C# word tokenizer (same table as the IDE). Path dependency, not a
+# workspace member: the tokenizer is its own addon repo.
+def2mcpfnnumber = { path = "../def2mcpfnnumber_rs_ide_addon" }
 
 [dev-dependencies]
 # Nothing beyond egui: the GUI smoke test runs `egui::Context` headlessly.

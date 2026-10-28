@@ -28,3 +28,6 @@ pub mod idelink_nzkide;
 
 #[path = "gui.nzkide.rs"]
 pub mod gui_nzkide;
+
+/// Crate version (kept in one place: `Cargo.toml`).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

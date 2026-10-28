@@ -37,6 +37,10 @@
 //! [`Request`](crate::idelink_scratch::Request); the host decides what that
 //! means. Unknown types are painted `?` — the painter cannot invent one.
 
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
+
 use egui::{
     Align2, Color32, CornerRadius, FontId, Pos2, Rect, ScrollArea, Sense, Stroke, StrokeKind, Vec2,
 };
@@ -85,22 +89,30 @@ impl Theme {
     ///
     /// `Plain`/`Punct` fall back to the theme's text colour at the call site.
     pub fn token(self, kind: TokenKind) -> Option<Color32> {
+        // The table is the IDE's own `SourceTheme::tok_color`, one arm per kind,
+        // so a word cannot be one colour in the editor and another in a block.
         let c = match (self, kind) {
-            (_, TokenKind::Plain | TokenKind::Punct) => return None,
+            (_, TokenKind::Plain) => return None,
+            (Theme::NzkDarkPlus, TokenKind::Comment) => 0x6a9955,
+            (Theme::NzkDarkPlus, TokenKind::Str) => 0xce9178,
             (Theme::NzkDarkPlus, TokenKind::Keyword) => 0x569cd6,
+            (Theme::NzkDarkPlus, TokenKind::Control) => 0xc586c0,
             (Theme::NzkDarkPlus, TokenKind::Type) => 0x4ec9b0,
-            (Theme::NzkDarkPlus, TokenKind::Method) => 0xdcdcaa,
-            (Theme::NzkDarkPlus, TokenKind::Variable) => 0x9cdcfe,
-            (Theme::NzkDarkPlus, TokenKind::String) => 0xce9178,
             (Theme::NzkDarkPlus, TokenKind::Number) => 0xb5cea8,
-            (Theme::NzkDarkPlus, TokenKind::Attribute) => 0xd7ba7d,
+            (Theme::NzkDarkPlus, TokenKind::Function) => 0xdcdcaa,
+            (Theme::NzkDarkPlus, TokenKind::Variable) => 0x9cdcfe,
+            (Theme::NzkDarkPlus, TokenKind::Op) => 0xd4d4d4,
+            (Theme::NzkDarkPlus, TokenKind::Preproc) => 0xc586c0,
+            (Theme::DarkV1, TokenKind::Comment) => 0x6a9955,
+            (Theme::DarkV1, TokenKind::Str) => 0xc8b6ff,
             (Theme::DarkV1, TokenKind::Keyword) => 0x86aaf9,
+            (Theme::DarkV1, TokenKind::Control) => 0xd272ff,
             (Theme::DarkV1, TokenKind::Type) => 0x42c3d0,
-            (Theme::DarkV1, TokenKind::Method) => 0xfa903e,
-            (Theme::DarkV1, TokenKind::Variable) => 0x9db8f0,
-            (Theme::DarkV1, TokenKind::String) => 0xc8b6ff,
             (Theme::DarkV1, TokenKind::Number) => 0xffc46b,
-            (Theme::DarkV1, TokenKind::Attribute) => 0xe57300,
+            (Theme::DarkV1, TokenKind::Function) => 0xfa903e,
+            (Theme::DarkV1, TokenKind::Variable) => 0x9db8f0,
+            (Theme::DarkV1, TokenKind::Op) => 0xd4d4d4,
+            (Theme::DarkV1, TokenKind::Preproc) => 0xe57300,
         };
         Some(Theme::rgb(c))
     }
@@ -117,6 +129,7 @@ impl Theme {
             (Theme::NzkDarkPlus, BlockKind::Keyword) => 0xce9178,
             (Theme::NzkDarkPlus, BlockKind::Simple) => 0x859191,
             (Theme::NzkDarkPlus, BlockKind::Directive) => 0x6a737d,
+            (Theme::NzkDarkPlus, BlockKind::Attribute) => 0xd7ba7d,
             (Theme::DarkV1, BlockKind::Namespace) => 0x86aaf9,
             (Theme::DarkV1, BlockKind::Type) => 0x42c3d0,
             (Theme::DarkV1, BlockKind::Method) => 0xfa903e,
@@ -125,6 +138,7 @@ impl Theme {
             (Theme::DarkV1, BlockKind::Keyword) => 0xf48385,
             (Theme::DarkV1, BlockKind::Simple) => 0x9aa6c2,
             (Theme::DarkV1, BlockKind::Directive) => 0x7a86a8,
+            (Theme::DarkV1, BlockKind::Attribute) => 0xe57300,
         };
         Theme::rgb(c)
     }
@@ -143,6 +157,7 @@ pub struct PaletteSpec {
     pub dim: Color32,
     pub border: Color32,
     pub accent: Color32,
+    pub comment: Color32,
     pub keyword: Color32,
     pub control: Color32,
     pub ty: Color32,
@@ -227,6 +242,7 @@ impl Palette {
                 BlockKind::Keyword => s.keyword,
                 BlockKind::Simple => s.dim,
                 BlockKind::Directive => s.preproc,
+                BlockKind::Attribute => s.preproc,
             };
         }
         self.theme.accent(kind)
@@ -242,16 +258,20 @@ impl Palette {
     /// "ordinary text", which is the theme's ink.
     pub fn token(&self, kind: TokenKind) -> Color32 {
         if let Some(s) = self.spec {
+            // Exactly `SourceTheme::tok_color` — the editor's palette, not a
+            // parallel table that can drift.
             return match kind {
                 TokenKind::Plain => s.fg,
-                TokenKind::Punct => s.op,
+                TokenKind::Comment => s.comment,
+                TokenKind::Str => s.string,
                 TokenKind::Keyword => s.keyword,
+                TokenKind::Control => s.control,
                 TokenKind::Type => s.ty,
-                TokenKind::Method => s.function,
-                TokenKind::Variable => s.variable,
-                TokenKind::String => s.string,
                 TokenKind::Number => s.number,
-                TokenKind::Attribute => s.preproc,
+                TokenKind::Function => s.function,
+                TokenKind::Variable => s.variable,
+                TokenKind::Op => s.op,
+                TokenKind::Preproc => s.preproc,
             };
         }
         self.theme.token(kind).unwrap_or(self.ink)
@@ -259,7 +279,7 @@ impl Palette {
 }
 
 /// GUI-local state: what the user changed, nothing derived.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct GuiState {
     /// The selected blocks as child paths (see [`ScratchDoc::block_at`]).
     /// More than one, because `Ctrl+click`/`Shift+click` builds a set and
@@ -279,6 +299,10 @@ pub struct GuiState {
     /// Modifier state captured at pointer-press, so a Ctrl+click adds to the
     /// selection even if the key is released before egui processes the click.
     pub press_additive: bool,
+    /// Shaped body text, keyed by text + wrap width + palette. The Source pane
+    /// already proved that re-shaping every line every frame is the expensive
+    /// part (58x on a 407-line document); the puzzle pieces get the same cache.
+    galley_cache: std::cell::RefCell<HashMap<u64, Arc<egui::Galley>>>,
 }
 
 impl GuiState {
@@ -290,6 +314,7 @@ impl GuiState {
             spec: None,
             highlight: None,
             press_additive: false,
+            galley_cache: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -319,6 +344,49 @@ impl GuiState {
             .map(|b| b.source(0))
             .collect::<Vec<_>>()
             .join("\n\n")
+    }
+}
+
+impl GuiState {
+    /// The shaped galley for a piece's body, reusing the last layout unless the
+    /// text, wrap width, theme, palette or pixel ratio changed.
+    fn body_galley(&self, ui: &egui::Ui, text: &str, wrap: f32, palette: &Palette) -> Arc<egui::Galley> {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        wrap.to_bits().hash(&mut h);
+        (self.theme as u8).hash(&mut h);
+        ui.ctx().pixels_per_point().to_bits().hash(&mut h);
+        if let Some(s) = &self.spec {
+            for c in [s.bg, s.head_bg, s.fg, s.dim, s.border, s.accent, s.comment, s.keyword,
+                      s.control, s.ty, s.iface, s.string, s.number, s.preproc, s.function,
+                      s.variable, s.op] {
+                c.to_array().hash(&mut h);
+            }
+        }
+        let key = h.finish();
+        if let Some(g) = self.galley_cache.borrow().get(&key) {
+            return g.clone();
+        }
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = wrap;
+        for span in tokens(text) {
+            job.append(
+                &text[span.start..span.end],
+                0.0,
+                egui::TextFormat {
+                    font_id: FontId::monospace(BODY_FONT),
+                    color: palette.token(span.kind),
+                    ..Default::default()
+                },
+            );
+        }
+        let g = ui.painter().layout_job(job);
+        let mut cache = self.galley_cache.borrow_mut();
+        if cache.len() > 4096 {
+            cache.clear();
+        }
+        cache.insert(key, g.clone());
+        g
     }
 }
 
@@ -460,24 +528,11 @@ fn paint_block(
     let max_w = (avail - indent).max(120.0);
     let text_max = text_max_width(avail, indent);
 
-    // VSCode-style: every word carries its own colour. The tokens cover the
-    // whole text (whitespace included), so nothing is dropped between sections.
+    // VSCode-style: every word carries its own colour, from the shared
+    // tokenizer. The shaped galley is cached: the text does not change between
+    // frames, and re-shaping every piece was the Scratch pane's lag.
     let text = block.text();
-    let font = FontId::monospace(BODY_FONT);
-    let mut job = egui::text::LayoutJob::default();
-    job.wrap.max_width = text_max;
-    for span in tokens(&text) {
-        job.append(
-            &text[span.start..span.end],
-            0.0,
-            egui::TextFormat {
-                font_id: font.clone(),
-                color: palette.token(span.kind),
-                ..Default::default()
-            },
-        );
-    }
-    let galley = ui.painter().layout_job(job);
+    let galley = state.body_galley(ui, &text, text_max, palette);
     let text_w = galley.size().x;
 
     let port_sizes: Vec<Vec2> = if state.show_ports {
@@ -777,6 +832,7 @@ mod tests {
                 BlockKind::Keyword,
                 BlockKind::Simple,
                 BlockKind::Directive,
+                BlockKind::Attribute,
             ];
             let mut accents: Vec<[u8; 4]> = kinds.iter().map(|k| theme.accent(*k).to_array()).collect();
             accents.sort();
@@ -791,18 +847,43 @@ mod tests {
         for theme in [Theme::NzkDarkPlus, Theme::DarkV1] {
             let p = Palette::new(theme, &egui::Visuals::dark());
             let kinds = [
+                TokenKind::Comment,
+                TokenKind::Str,
                 TokenKind::Keyword,
+                TokenKind::Control,
                 TokenKind::Type,
-                TokenKind::Method,
-                TokenKind::Variable,
-                TokenKind::String,
                 TokenKind::Number,
-                TokenKind::Attribute,
+                TokenKind::Function,
+                TokenKind::Variable,
+                TokenKind::Op,
+                TokenKind::Preproc,
             ];
-            let mut colours: Vec<[u8; 4]> = kinds.iter().map(|k| p.token(*k).to_array()).collect();
-            colours.sort();
-            colours.dedup();
-            assert_eq!(colours.len(), kinds.len(), "each word kind is distinct");
+            // Dark+ is the shipped IDE palette, arm for arm. Control and
+            // preproc deliberately share a colour (`#c586c0`), so distinctness
+            // is not the invariant — equality to the editor is.
+            if theme == Theme::NzkDarkPlus {
+            for (kind, expected) in [
+                (TokenKind::Comment, 0x6a9955u32),
+                (TokenKind::Str, 0xce9178),
+                (TokenKind::Keyword, 0x569cd6),
+                (TokenKind::Control, 0xc586c0),
+                (TokenKind::Type, 0x4ec9b0),
+                (TokenKind::Number, 0xb5cea8),
+                (TokenKind::Function, 0xdcdcaa),
+                (TokenKind::Variable, 0x9cdcfe),
+                (TokenKind::Op, 0xd4d4d4),
+                (TokenKind::Preproc, 0xc586c0),
+            ] {
+                let got = p.token(kind).to_array();
+                let want = Color32::from_rgb(
+                    (expected >> 16) as u8,
+                    (expected >> 8) as u8,
+                    expected as u8,
+                )
+                .to_array();
+                assert_eq!(got, want, "{kind:?} must be the IDE colour");
+            }
+            }
             assert_eq!(p.token(TokenKind::Plain), p.ink, "plain text is the theme ink");
         }
     }

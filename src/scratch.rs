@@ -51,6 +51,10 @@ pub enum BlockKind {
     /// A preprocessor line: `#if`, `#region`, `#pragma`, … Kept as its own
     /// block so it cannot glue itself to the statement that follows it.
     Directive,
+    /// One leading `[Attribute(…)]` run, shown as its own small piece before
+    /// the declaration it annotates. Attributes used to be glued to the
+    /// declaration, which made one block out of several concepts.
+    Attribute,
 }
 
 impl BlockKind {
@@ -65,6 +69,7 @@ impl BlockKind {
             BlockKind::Keyword => "keyword",
             BlockKind::Simple => "simple",
             BlockKind::Directive => "directive",
+            BlockKind::Attribute => "attribute",
         }
     }
 }
@@ -436,7 +441,7 @@ impl Scan {
             let mut text = String::new();
             self.skip_trivia(&mut text);
             if self.peek().is_none() {
-                self.push_leaf(out, sig, &text, Term::None);
+                self.push_leaf(out, sig, &text, Term::None, self.line);
                 if !text.trim().is_empty() && top {
                     warnings.push(format!(
                         "line {}: text after the last statement has no `;` or `{{`",
@@ -451,7 +456,7 @@ impl Scan {
                     warnings.push(format!("line {}: unmatched `}}`", self.line));
                     continue;
                 }
-                self.push_leaf(out, sig, &text, Term::None);
+                self.push_leaf(out, sig, &text, Term::None, self.line);
                 return true;
             }
 
@@ -467,7 +472,7 @@ impl Scan {
                     }
                     dir.push(c);
                 }
-                out.push(make_block(
+                out.extend(make_blocks(
                     dir.trim(),
                     Vec::new(),
                     true,
@@ -484,7 +489,7 @@ impl Scan {
             let mut brack = 0i32;
             loop {
                 let Some(c) = self.peek() else {
-                    self.push_leaf(out, sig, &text, Term::None);
+                    self.push_leaf(out, sig, &text, Term::None, self.line);
                     return false;
                 };
                 match c {
@@ -522,7 +527,7 @@ impl Scan {
                                 "line {start_line}: `{{` opened here is never closed"
                             ));
                         }
-                        out.push(make_block(
+                        out.extend(make_blocks(
                             &header,
                             children,
                             closed,
@@ -534,7 +539,7 @@ impl Scan {
                         break;
                     }
                     '}' if paren <= 0 && brack <= 0 => {
-                        self.push_leaf(out, sig, &text, Term::None);
+                        self.push_leaf(out, sig, &text, Term::None, self.line);
                         self.bump();
                         if top {
                             warnings.push(format!("line {}: unmatched `}}`", self.line));
@@ -547,17 +552,17 @@ impl Scan {
                     // of the call on the next line.
                     ':' if paren <= 0 && brack <= 0 && is_case_label(&text) => {
                         self.bump();
-                        self.push_leaf(out, sig, &text, Term::Colon);
+                        self.push_leaf(out, sig, &text, Term::Colon, start_line);
                         break;
                     }
                     ';' if paren <= 0 && brack <= 0 => {
                         self.bump();
-                        self.push_leaf(out, sig, &text, Term::Semi);
+                        self.push_leaf(out, sig, &text, Term::Semi, start_line);
                         break;
                     }
                     ',' if comma_ends_statement && paren <= 0 && brack <= 0 => {
                         self.bump();
-                        self.push_leaf(out, sig, &text, Term::Comma);
+                        self.push_leaf(out, sig, &text, Term::Comma, start_line);
                         break;
                     }
                     '/' if matches!(self.at(1), Some('/') | Some('*')) => {
@@ -569,16 +574,64 @@ impl Scan {
         }
     }
 
-    fn push_leaf(&self, out: &mut Vec<Block>, sig: &Signature, text: &str, term: Term) {
+    fn push_leaf(
+        &self,
+        out: &mut Vec<Block>,
+        sig: &Signature,
+        text: &str,
+        term: Term,
+        start_line: usize,
+    ) {
         let t = text.trim();
         if t.is_empty() {
             return;
         }
-        out.push(make_block(t, Vec::new(), true, self.line, self.line, sig, term));
+        out.extend(make_blocks(t, Vec::new(), true, start_line, self.line, sig, term));
     }
 }
 
-/// Build one block from its header text (and already-parsed children).
+/// Build one statement as one or more blocks: each leading attribute becomes a
+/// small piece of its own, then the declaration follows.
+///
+/// Splitting them is what keeps a Scratch piece to one concept. Before this, a
+/// field with a three-line `[Tooltip(…)]` was a single block whose text was
+/// mostly the attribute, and a class with two attributes was one wide block
+/// that wrapped. The declaration no longer owns its attributes visually.
+fn make_blocks(
+    header: &str,
+    children: Vec<Block>,
+    closed: bool,
+    start_line: usize,
+    end_line: usize,
+    sig: &Signature,
+    terminator: Term,
+) -> Vec<Block> {
+    let (attrs, rest_off) = leading_attributes(header);
+    let mut out = Vec::with_capacity(attrs.len() + 1);
+    for (text, off) in attrs {
+        let line = start_line + header[..off].matches('\n').count();
+        let end = line + text.matches('\n').count();
+        out.push(Block {
+            kind: BlockKind::Attribute,
+            attrs: String::new(),
+            head: text,
+            body: String::new(),
+            ports: Vec::new(),
+            children: Vec::new(),
+            line,
+            end_line: end,
+            closed: true,
+            terminator: Term::None,
+        });
+    }
+    let rest = header[rest_off..].trim();
+    let decl_line = start_line + header[..rest_off].matches('\n').count();
+    out.push(make_block(rest, children, closed, decl_line, end_line, sig, terminator));
+    out
+}
+
+/// Build one declaration block from text whose attributes have already been
+/// peeled off (see [`make_blocks`]).
 fn make_block(
     header: &str,
     children: Vec<Block>,
@@ -588,22 +641,17 @@ fn make_block(
     sig: &Signature,
     terminator: Term,
 ) -> Block {
-    // `[SerializeField] private int count` is a field with an attribute, so the
-    // attribute run is peeled off BEFORE the construct is classified and its
-    // ports read. It is still shown, just not allowed to own the block.
-    let (attrs, rest) = split_leading_attributes(header);
-    let (mut kind, head, body) = classify(rest, !children.is_empty());
+    let (mut kind, head, body) = classify(header, !children.is_empty());
     // `public bool IsSound { get; }` has no parameter list, so `classify` sees a
     // plain declaration; the accessor children are what make it a property.
     if kind == BlockKind::Simple && children.iter().any(|c| c.kind == BlockKind::Property) {
         kind = BlockKind::Property;
-        let ports = Vec::new();
         return Block {
             kind,
-            attrs,
+            attrs: String::new(),
             head,
             body,
-            ports,
+            ports: Vec::new(),
             children,
             line,
             end_line,
@@ -620,7 +668,18 @@ fn make_block(
         }
         ports.clear();
     }
-    Block { kind, attrs, head, body, ports, children, line, end_line, closed, terminator }
+    Block {
+        kind,
+        attrs: String::new(),
+        head,
+        body,
+        ports,
+        children,
+        line,
+        end_line,
+        closed,
+        terminator,
+    }
 }
 
 /// Peel leading `[ … ]` attribute runs off a declaration header.
@@ -628,10 +687,27 @@ fn make_block(
 /// Returns `(joined_attrs, rest)`. Bracket matching honours strings, so
 /// `[Tooltip("a]b")]` stays one attribute.
 fn split_leading_attributes(header: &str) -> (String, &str) {
-    let mut attrs: Vec<String> = Vec::new();
-    let mut rest = header.trim_start();
-    while rest.starts_with('[') {
-        let chars: Vec<char> = rest.chars().collect();
+    let (attrs, rest_off) = leading_attributes(header);
+    let joined = attrs.into_iter().map(|(text, _)| text).collect::<Vec<_>>().join(" ");
+    (joined, &header[rest_off..])
+}
+
+/// Peel the leading `[ … ]` runs, returning each one's text and byte offset in
+/// `header`, plus the offset where the declaration proper starts.
+///
+/// Bracket matching honours strings, so `[Tooltip("a]b")]` stays one attribute.
+fn leading_attributes(header: &str) -> (Vec<(String, usize)>, usize) {
+    let mut attrs: Vec<(String, usize)> = Vec::new();
+    let mut rest = 0usize;
+    loop {
+        let slice = &header[rest..];
+        let ws = slice.len() - slice.trim_start().len();
+        let start = rest + ws;
+        if start >= header.len() || !header[start..].starts_with('[') {
+            rest = start;
+            break;
+        }
+        let chars: Vec<char> = header[start..].chars().collect();
         let mut depth = 0i32;
         let mut in_str: Option<char> = None;
         let mut end = None;
@@ -655,7 +731,7 @@ fn split_leading_attributes(header: &str) -> (String, &str) {
                 ']' => {
                     depth -= 1;
                     if depth == 0 {
-                        end = Some(char_index_to_byte(rest, i));
+                        end = Some(i);
                         break;
                     }
                 }
@@ -664,10 +740,16 @@ fn split_leading_attributes(header: &str) -> (String, &str) {
             i += 1;
         }
         let Some(end) = end else { break };
-        attrs.push(rest[..=end].trim().to_string());
-        rest = rest[end + 1..].trim_start();
+        let end_byte = start
+            + header[start..]
+                .char_indices()
+                .nth(end)
+                .map(|(b, _)| b)
+                .unwrap_or(header.len() - start);
+        attrs.push((header[start..=end_byte].trim().to_string(), start));
+        rest = end_byte + 1;
     }
-    (attrs.join(" "), rest)
+    (attrs, rest)
 }
 
 /// Split a header into its construct, the rest, and what kind of block it is.
@@ -795,7 +877,7 @@ fn ports_for(kind: BlockKind, head: &str, body: &str, sig: &Signature) -> Vec<Po
         // declaration: they have no ports of their own.
         BlockKind::Property => Vec::new(),
         BlockKind::Simple => simple_ports(&format!("{head} {body}")),
-        BlockKind::Type | BlockKind::Namespace | BlockKind::Directive => Vec::new(),
+        BlockKind::Type | BlockKind::Namespace | BlockKind::Directive | BlockKind::Attribute => Vec::new(),
     }
 }
 
@@ -1271,29 +1353,45 @@ class Foo {
     }
 
     #[test]
-    fn attributes_annotate_the_declaration_instead_of_owning_it() {
+    fn attributes_are_their_own_small_pieces() {
+        // The granularity fix: a field with two attributes is three pieces, so
+        // one block no longer carries a whole attribute run plus a declaration.
         let src = "[SerializeField]\n[Tooltip(\"a]b\")]\nprivate int count = 0;";
         let p = parse(src, &Signature::default());
-        assert_eq!(p.blocks.len(), 1, "one field, not an attribute block");
-        let b = &p.blocks[0];
+        assert_eq!(p.blocks.len(), 3, "two attribute pieces + the field");
+        assert_eq!(p.blocks[0].kind, BlockKind::Attribute);
+        assert_eq!(p.blocks[0].head, "[SerializeField]");
+        assert_eq!(p.blocks[1].kind, BlockKind::Attribute);
+        assert_eq!(p.blocks[1].head, "[Tooltip(\"a]b\")]");
+        let b = &p.blocks[2];
         assert_eq!(b.kind, BlockKind::Simple);
-        assert_eq!(b.attrs, "[SerializeField] [Tooltip(\"a]b\")]");
         assert_eq!(b.head, "private int count = 0");
         assert_eq!(b.ports[0].name, "count");
         assert_eq!(b.ports[0].ty.as_deref(), Some("int"));
-        assert!(b.text().starts_with("[SerializeField]"), "the attribute is still shown");
+        assert!(!b.text().contains("SerializeField"), "the declaration no longer owns it");
     }
 
     #[test]
     fn an_attributed_class_keeps_its_body() {
         let p = parse("[UnityEngine.AddComponentMenu(\"X\")]\npublic class Foo { void A() { } }", &Signature::default());
-        assert_eq!(p.blocks.len(), 1);
-        let c = &p.blocks[0];
+        assert_eq!(p.blocks.len(), 2, "the attribute piece and the class");
+        assert_eq!(p.blocks[0].kind, BlockKind::Attribute);
+        let c = &p.blocks[1];
         assert_eq!(c.kind, BlockKind::Type);
         assert_eq!(c.head, "class");
         assert_eq!(c.body, "Foo");
-        assert_eq!(c.attrs, "[UnityEngine.AddComponentMenu(\"X\")]");
         assert_eq!(c.children.len(), 1);
+    }
+
+    #[test]
+    fn a_two_attribute_class_is_three_pieces_not_one_wide_block() {
+        let src = "[A] [B]\npublic class Foo : Bar { int x; }";
+        let p = parse(src, &Signature::default());
+        assert_eq!(p.blocks.len(), 3);
+        assert_eq!(p.blocks[0].head, "[A]");
+        assert_eq!(p.blocks[1].head, "[B]");
+        assert_eq!(p.blocks[2].body, "Foo : Bar");
+        assert_eq!(p.blocks[2].children.len(), 1);
     }
 
     #[test]
@@ -1434,16 +1532,17 @@ int F(bool b) {
             let i = text.find(needle).expect(needle);
             spans.iter().find(|s| s.start <= i && i < s.end).expect("span").kind
         };
-        assert_eq!(kind_at("[UnityEngine"), TokenKind::Attribute);
+        assert_eq!(kind_at("[UnityEngine"), TokenKind::Op, "the bracket is punctuation");
+        assert_eq!(kind_at("UnityEngine"), TokenKind::Type);
         assert_eq!(kind_at("public"), TokenKind::Keyword);
         assert_eq!(kind_at("Transform"), TokenKind::Type);
-        assert_eq!(kind_at("ResolveAnimated"), TokenKind::Method);
+        assert_eq!(kind_at("ResolveAnimated"), TokenKind::Function);
         assert_eq!(kind_at("int"), TokenKind::Keyword);
         assert_eq!(kind_at("null"), TokenKind::Keyword);
-        // The only literal in this text sits inside the attribute run, so it is
-        // coloured as part of it — the attribute span is one token.
-        assert_eq!(kind_at("\"x\""), TokenKind::Attribute);
-        assert_eq!(kind_at("{"), TokenKind::Punct);
+        // The attribute's contents are ordinary tokens: the string is a string,
+        // not part of one preproc-coloured attribute run.
+        assert_eq!(kind_at("\"x\""), TokenKind::Str);
+        assert_eq!(kind_at("{"), TokenKind::Op);
     }
 
     #[test]
@@ -1455,7 +1554,7 @@ int F(bool b) {
             spans.iter().find(|s| s.start <= i && i < s.end).expect("span").kind
         };
         assert_eq!(kind_at("0.25f"), TokenKind::Number);
-        assert_eq!(kind_at("\"a;b\""), TokenKind::String);
+        assert_eq!(kind_at("\"a;b\""), TokenKind::Str);
         assert_eq!(kind_at("var"), TokenKind::Keyword);
     }
 
@@ -1490,199 +1589,10 @@ int F(bool b) {
 }
 
 // ---------------------------------------------------------------------------
-// token colours (VSCode-style, for the painter)
+// token colours
 // ---------------------------------------------------------------------------
 
-/// What a word *is*, so the painter can colour it like an editor would.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TokenKind {
-    /// Whitespace and anything unclassified.
-    Plain,
-    /// `if`, `return`, `public`, `int`, `true`, …
-    Keyword,
-    /// A name that starts with a capital: `UnityEngine`, `NzkSps2AnimTarget`.
-    Type,
-    /// A name immediately followed by `(`.
-    Method,
-    /// Everything else with a name: locals, parameters, fields.
-    Variable,
-    /// A string or character literal.
-    String,
-    /// A numeric literal.
-    Number,
-    /// A `[ … ]` attribute run.
-    Attribute,
-    /// Brackets, operators, punctuation.
-    Punct,
-}
-
-/// A byte range of the block text with one token kind.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Span {
-    pub start: usize,
-    pub end: usize,
-    pub kind: TokenKind,
-}
-
-/// C# words that are coloured as keywords (control flow, modifiers, built-in
-/// types and the literals). Not a grammar — a colouring table.
-const KEYWORDS: &[&str] = &[
-    "abstract", "as", "async", "await", "base", "bool", "break", "byte", "case", "catch",
-    "char", "checked", "class", "const", "continue", "decimal", "default", "delegate", "do",
-    "double", "else", "enum", "event", "explicit", "extern", "false", "finally", "fixed",
-    "float", "for", "foreach", "get", "goto", "if", "implicit", "in", "init", "int",
-    "interface", "internal", "is", "lock", "long", "namespace", "new", "null", "object",
-    "operator", "out", "override", "params", "partial", "private", "protected", "public",
-    "readonly", "record", "ref", "return", "sbyte", "sealed", "set", "short", "sizeof",
-    "stackalloc", "static", "string", "struct", "switch", "this", "throw", "true", "try",
-    "typeof", "uint", "ulong", "unchecked", "unsafe", "ushort", "using", "var", "virtual",
-    "void", "volatile", "while", "yield",
-];
-
-/// Split `text` into contiguous spans covering every byte, so a painter can
-/// colour each word and append them without losing the whitespace between them.
-pub fn tokens(text: &str) -> Vec<Span> {
-    let b = text.as_bytes();
-    let n = b.len();
-    let mut out: Vec<Span> = Vec::new();
-    let mut i = 0usize;
-    while i < n {
-        let start = i;
-        let c = b[i];
-        if c.is_ascii_whitespace() {
-            while i < n && b[i].is_ascii_whitespace() {
-                i += 1;
-            }
-            out.push(Span { start, end: i, kind: TokenKind::Plain });
-        } else if c == b'[' {
-            i = attribute_end(b, i);
-            out.push(Span { start, end: i, kind: TokenKind::Attribute });
-        } else if is_string_start(b, i) {
-            i = string_end(b, i);
-            out.push(Span { start, end: i, kind: TokenKind::String });
-        } else if c.is_ascii_digit() {
-            i += 1;
-            while i < n
-                && (b[i].is_ascii_alphanumeric() || b[i] == b'.' || b[i] == b'_')
-            {
-                i += 1;
-            }
-            out.push(Span { start, end: i, kind: TokenKind::Number });
-        } else if is_ident_start(c) {
-            i += 1;
-            while i < n && is_ident_continue(b[i]) {
-                i += 1;
-            }
-            let word = &text[start..i];
-            let kind = if KEYWORDS.contains(&word) {
-                TokenKind::Keyword
-            } else {
-                let mut j = i;
-                while j < n && b[j].is_ascii_whitespace() {
-                    j += 1;
-                }
-                if b.get(j) == Some(&b'(') {
-                    TokenKind::Method
-                } else if word.chars().next().is_some_and(char::is_uppercase) {
-                    TokenKind::Type
-                } else {
-                    TokenKind::Variable
-                }
-            };
-            out.push(Span { start, end: i, kind });
-        } else {
-            i += 1;
-            out.push(Span { start, end: i, kind: TokenKind::Punct });
-        }
-    }
-    out
-}
-
-fn is_ident_start(c: u8) -> bool {
-    c.is_ascii_alphabetic() || c == b'_' || c == b'@'
-}
-
-fn is_ident_continue(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_'
-}
-
-fn is_string_start(b: &[u8], i: usize) -> bool {
-    match b[i] {
-        b'"' | b'\'' => true,
-        b'@' => matches!(b.get(i + 1), Some(b'"')),
-        b'$' => matches!(b.get(i + 1), Some(b'"') | Some(b'@')),
-        _ => false,
-    }
-}
-
-fn string_end(b: &[u8], start: usize) -> usize {
-    let n = b.len();
-    let mut i = start;
-    while i < n && (b[i] == b'$' || b[i] == b'@') {
-        i += 1;
-    }
-    if i < n && (b[i] == b'"' || b[i] == b'\'') {
-        let q = b[i];
-        // Count the opening run: 2 = empty literal, 3+ = raw string.
-        let mut run = 0usize;
-        while i < n && b[i] == q {
-            run += 1;
-            i += 1;
-        }
-        if q == b'"' && run >= 3 {
-            let mut r = 0usize;
-            while i < n {
-                if b[i] == b'"' {
-                    r += 1;
-                    if r == run {
-                        return i + 1;
-                    }
-                } else {
-                    r = 0;
-                }
-                i += 1;
-            }
-            return n;
-        }
-        if q == b'"' && run == 2 {
-            return i;
-        }
-        while i < n {
-            if b[i] == b'\\' {
-                i += 2;
-                continue;
-            }
-            if b[i] == q {
-                return i + 1;
-            }
-            i += 1;
-        }
-        return n;
-    }
-    i
-}
-
-fn attribute_end(b: &[u8], start: usize) -> usize {
-    let n = b.len();
-    let mut depth = 0i32;
-    let mut i = start;
-    while i < n {
-        match b[i] {
-            b'"' => {
-                i = string_end(b, i);
-                continue;
-            }
-            b'[' => depth += 1,
-            b']' => {
-                depth -= 1;
-                if depth == 0 {
-                    return i + 1;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    n
-}
-
+// The tokenizer is the tokenizer addon, not a second copy in this crate: the
+// IDE and the puzzle pieces must colour the same word the same way. Scratch
+// re-exports it so callers keep importing `scratch::{tokens, TokenKind}`.
+pub use def2mcpfnnumber::syntax::{Span, TokenKind, tokens};
