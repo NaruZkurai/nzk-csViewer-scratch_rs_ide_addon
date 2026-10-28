@@ -22,3 +22,9 @@ pub mod idelink_scratch;
 
 #[path = "gui.scratch.rs"]
 pub mod gui_scratch;
+
+#[path = "idelink.nzkide.rs"]
+pub mod idelink_nzkide;
+
+#[path = "gui.nzkide.rs"]
+pub mod gui_nzkide;

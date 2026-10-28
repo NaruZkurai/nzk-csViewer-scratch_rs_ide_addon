@@ -118,19 +118,15 @@ fn header(ui: &mut egui::Ui, doc: &ScratchDoc, state: &mut GuiState) {
                 .color(Color32::from_rgb(148, 163, 184)),
         );
     });
-    ui.horizontal_wrapped(|ui| {
-        if !doc.location.is_empty() {
-            ui.monospace(&doc.location);
-        }
-        if !doc.kind.is_empty() {
-            ui.weak(format!("· {}", doc.kind));
-        }
-        ui.weak(format!("· {} blocks", doc.count()));
-        ui.weak(if doc.from_source_pane { "· from the source pane" } else { "· from the graph" });
-        ui.separator();
+    // The shared IDE context strip (`gui.nzkide`): breadcrumb + live state. The
+    // Scratch window is a view of what the IDE is looking at, and this is where
+    // it says so.
+    let ctx = crate::idelink_nzkide::IdeContext::from_doc(doc);
+    crate::gui_nzkide::context_strip(ui, &ctx);
+    ui.horizontal(|ui| {
         ui.checkbox(&mut state.show_ports, "ports");
+        ui.weak(if doc.from_source_pane { "· from the source pane" } else { "· from the graph" });
     });
-    ui.separator();
 }
 
 /// Draw one piece and its children.
