@@ -517,7 +517,7 @@ impl Scan {
                         // semicolons; everything else uses `;`.
                         let (attrs, rest) = split_leading_attributes(&header);
                         let (hkind, hhead, _) = classify(rest, true);
-                        let is_enum = hkind == BlockKind::Type && hhead == "enum";
+                        let is_enum = hkind == BlockKind::Type && hhead.ends_with("enum");
                         let _ = attrs;
                         let mut children = Vec::new();
                         let closed =
@@ -661,7 +661,7 @@ fn make_block(
     }
     let mut ports = ports_for(kind, &head, &body, sig);
     let mut children = children;
-    if kind == BlockKind::Type && head == "enum" {
+    if kind == BlockKind::Type && head.ends_with("enum") {
         // `Sound = 0` is a value of `Kind`, not a typed declaration of its own.
         for child in &mut children {
             child.ports.clear();
@@ -773,6 +773,15 @@ fn classify(header: &str, has_children: bool) -> (BlockKind, String, String) {
         skipped += 1;
     }
     let rest = after_mods[word.len()..].trim().to_string();
+    // Keep the modifiers in the displayed head: `public partial class Foo` is
+    // the declaration, and a block that silently dropped `public partial` was
+    // not showing the code it claimed to show. `rest` is still only the part
+    // after the construct keyword (`Foo : Base`).
+    let head = t
+        .get(..t.len().saturating_sub(rest.len()))
+        .unwrap_or(t)
+        .trim()
+        .to_string();
     let kind = match word.as_str() {
         "namespace" => BlockKind::Namespace,
         "class" | "struct" | "interface" | "enum" | "record" | "delegate" => BlockKind::Type,
@@ -803,7 +812,7 @@ fn classify(header: &str, has_children: bool) -> (BlockKind, String, String) {
             return (BlockKind::Simple, t.to_string(), String::new());
         }
     };
-    (kind, word, rest)
+    (kind, head, rest)
 }
 
 /// True when a statement so far is a `case …` / `default` label.
@@ -1378,7 +1387,7 @@ class Foo {
         assert_eq!(p.blocks[0].kind, BlockKind::Attribute);
         let c = &p.blocks[1];
         assert_eq!(c.kind, BlockKind::Type);
-        assert_eq!(c.head, "class");
+        assert_eq!(c.head, "public class");
         assert_eq!(c.body, "Foo");
         assert_eq!(c.children.len(), 1);
     }
@@ -1478,7 +1487,7 @@ int F(bool b) {
     #[test]
     fn enum_members_are_separate_blocks() {
         let p = parse("public enum Kind { Sound = 0, Object = 1 }", &Signature::default());
-        let e = find(&p.blocks, "enum").expect("enum");
+        let e = find(&p.blocks, "public enum").expect("enum");
         assert_eq!(e.kind, BlockKind::Type);
         assert_eq!(e.children.len(), 2, "members split on top-level commas");
         assert_eq!(e.children[0].head, "Sound = 0");
