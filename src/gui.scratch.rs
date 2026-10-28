@@ -9,33 +9,38 @@
 //! # The piece
 //!
 //! ```text
-//!    ╭─╮──────────────╮        ← the notch is a bg-coloured circle cut into
-//!    │ ╰ if (bool)    │          the top-left corner
-//!    ╰───╮────────────╯
-//!        ╰─╯                     ← the tab is the same fill, below the bottom
+//!    ╭─╮──────────────────────╮     ← the notch is a bg-coloured circle cut
+//!    │ ╰ if (n <= 0)          │       into the top-left corner
+//!    │   return;              │     ← text WRAPS; a piece grows downward
+//!    │   [condition: bool]    │     ← ports sit on their own row(s) below it
+//!    ╰───╮────────────────────╯
+//!        ╰─╯                        ← the tab is the same fill, below the body
 //! ```
 //!
-//! A block is drawn at its indentation, a full-width row is allocated for the
-//! hit area, and children are drawn after it with a spine at their depth. Ports
-//! are pills to the right of the text: `n: int`, `-> void`, `?: type unknown`.
+//! # Two rules learned the hard way
+//!
+//! * **Nothing is cut off.** The first build clamped a piece to one row and
+//!   painted `…` over the tail (`[UnityEngine.Tooltip("Display name…")] public…`
+//!   on the desktop). Text is now laid out with a wrap width, so the piece grows
+//!   instead of hiding the author's code.
+//! * **A port row always fits.** Ports are packed into rows against the piece's
+//!   own width; the earlier build started the row past the right edge and the
+//!   paint loop broke on its first pill (no pill was ever visible).
 //!
 //! # What it never does
 //!
-//! It does not edit. A click selects a block and emits
-//! [`Request::Reveal`](crate::idelink_scratch::Request::Reveal); the host decides
-//! what that means. Unknown types are painted `?` — the painter has no way to
-//! invent one.
+//! It does not edit. A click selects a block and emits one
+//! [`Request`](crate::idelink_scratch::Request); the host decides what that
+//! means. Unknown types are painted `?` — the painter cannot invent one.
 
 use egui::{
-    Align2, Color32, CornerRadius, FontId, Pos2, Rect, Response, ScrollArea, Sense, Stroke,
-    StrokeKind, Vec2,
+    Align2, Color32, CornerRadius, FontId, Pos2, Rect, ScrollArea, Sense, Stroke, StrokeKind, Vec2,
 };
 
 use crate::idelink_scratch::{Request, ScratchDoc};
 use crate::scratch::Block;
 
-/// How tall one piece is, and how much room the next one leaves for its tab.
-const PIECE_H: f32 = 30.0;
+/// Room the next piece leaves for this one's tab.
 const ROW_GAP: f32 = 9.0;
 const INDENT: f32 = 20.0;
 const PAD: f32 = 10.0;
@@ -44,6 +49,13 @@ const NOTCH_R: f32 = 6.0;
 const TEXT_X: f32 = 18.0;
 const TAB_W: f32 = 14.0;
 const TAB_H: f32 = 9.0;
+/// One port pill row.
+const PORT_H: f32 = 18.0;
+const PORT_GAP: f32 = 4.0;
+/// Space between the last text line and the first port row.
+const PORTS_TOP: f32 = 6.0;
+const MIN_PIECE_W: f32 = 150.0;
+const MIN_PIECE_H: f32 = 30.0;
 
 /// GUI-local state: what the user changed, nothing derived.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -77,6 +89,8 @@ pub fn block_color(kind: crate::scratch::BlockKind) -> Color32 {
 
 /// Text on a piece. Dark on every fill above.
 const INK: Color32 = Color32::from_rgb(24, 28, 38);
+const BODY_FONT: f32 = 13.0;
+const PORT_FONT: f32 = 11.0;
 
 /// Paint the whole document and return the requests the user's clicks made.
 pub fn ui(ui: &mut egui::Ui, doc: &ScratchDoc, state: &mut GuiState) -> Vec<Request> {
@@ -131,7 +145,53 @@ fn header(ui: &mut egui::Ui, doc: &ScratchDoc, state: &mut GuiState) {
     });
 }
 
-/// Draw one piece and its children.
+/// One packed run of port pills.
+#[derive(Clone, Debug, PartialEq)]
+struct PortRow {
+    /// `(port index, pill size)` in source order.
+    items: Vec<(usize, Vec2)>,
+    width: f32,
+}
+
+/// Pack pills into rows no wider than `max_w`.
+///
+/// A pill wider than the row occupies a row alone (it is clipped by the piece's
+/// own width, never by arithmetic that starts it outside the piece).
+fn pack_ports(sizes: &[Vec2], max_w: f32) -> Vec<PortRow> {
+    let mut rows: Vec<PortRow> = Vec::new();
+    let mut current = PortRow { items: Vec::new(), width: 0.0 };
+    for (i, size) in sizes.iter().copied().enumerate() {
+        let extra = if current.items.is_empty() { size.x } else { PORT_GAP + size.x };
+        if !current.items.is_empty() && current.width + extra > max_w {
+            rows.push(std::mem::replace(&mut current, PortRow { items: Vec::new(), width: 0.0 }));
+            current.items.push((i, size));
+            current.width = size.x;
+        } else {
+            current.items.push((i, size));
+            current.width += extra;
+        }
+    }
+    if !current.items.is_empty() {
+        rows.push(current);
+    }
+    rows
+}
+
+/// The text width a piece may use, given the row it sits in.
+fn text_max_width(avail: f32, indent: f32) -> f32 {
+    (avail - indent - TEXT_X - PAD).max(60.0)
+}
+
+/// Height of the port block for `rows` rows (zero when there are none).
+fn ports_height(rows: usize) -> f32 {
+    if rows == 0 {
+        0.0
+    } else {
+        PORTS_TOP + rows as f32 * PORT_H + (rows.saturating_sub(1)) as f32 * PORT_GAP
+    }
+}
+
+/// Draw one piece and its children; returns the piece's rectangle.
 fn paint_block(
     ui: &mut egui::Ui,
     doc: &ScratchDoc,
@@ -140,68 +200,54 @@ fn paint_block(
     depth: usize,
     state: &mut GuiState,
     requests: &mut Vec<Request>,
-) {
+) -> Rect {
     let avail = ui.available_width();
     let indent = depth as f32 * INDENT;
-    let text = truncate(&block.text(), 110);
-    let font = FontId::monospace(13.0);
-    let galley = ui.painter().layout_no_wrap(text, font.clone(), INK);
+    let max_w = (avail - indent).max(120.0);
+    let text_max = text_max_width(avail, indent);
+
+    // Wrap, never truncate: the piece grows downward instead of hiding text.
+    let font = FontId::monospace(BODY_FONT);
+    let galley = ui.painter().layout(block.text(), font, INK, text_max);
     let text_w = galley.size().x;
 
-    let ports_w = if state.show_ports {
-        block
-            .ports
-            .iter()
-            .map(|p| port_size(ui, p).x + 4.0)
-            .sum::<f32>()
+    let port_sizes: Vec<Vec2> = if state.show_ports {
+        block.ports.iter().map(|p| port_size(ui, p)).collect()
     } else {
-        0.0
+        Vec::new()
     };
+    let rows = pack_ports(&port_sizes, text_max);
+    let ports_w = rows.iter().map(|r| r.width).fold(0.0, f32::max);
+    let ports_h = ports_height(rows.len());
 
-    let width = piece_width(text_w, ports_w, avail, indent);
-    let (row, resp) = ui.allocate_exact_size(
-        Vec2::new(avail, PIECE_H + ROW_GAP),
-        Sense::click(),
-    );
-    let piece = Rect::from_min_size(row.min + Vec2::new(indent, 0.0), Vec2::new(width, PIECE_H));
+    let width = (TEXT_X + text_w.max(ports_w) + PAD).max(MIN_PIECE_W).min(max_w);
+    let height = (PAD * 0.6 + galley.size().y + ports_h + PAD * 0.6).max(MIN_PIECE_H);
+
+    let (row, resp) =
+        ui.allocate_exact_size(Vec2::new(avail, height + ROW_GAP), Sense::click());
+    let piece = Rect::from_min_size(row.min + Vec2::new(indent, 0.0), Vec2::new(width, height));
 
     let selected = state.selected.as_deref() == Some(path.as_slice());
-    let fill = block_color(block.kind);
-    paint_piece(ui, piece, fill, selected);
+    paint_piece(ui, piece, block_color(block.kind), selected);
 
-    // Text, clipped to the piece.
-    let text_pos = Pos2::new(piece.left() + TEXT_X, piece.center().y);
-    ui.painter().galley(
-        text_pos - Vec2::new(0.0, galley.size().y / 2.0),
-        galley,
-        INK,
-    );
+    let text_pos = Pos2::new(piece.left() + TEXT_X, piece.top() + PAD * 0.6);
+    let text_h = galley.size().y;
+    ui.painter().galley(text_pos, galley, INK);
 
-    if state.show_ports {
-        let mut x = piece.left() + TEXT_X + text_w + 10.0;
-        for port in &block.ports {
-            let size = port_size(ui, port);
-            if x + size.x > piece.right() - 4.0 {
-                break;
+    if !rows.is_empty() {
+        let mut y = text_pos.y + text_h + PORTS_TOP;
+        for row in &rows {
+            let mut x = piece.left() + TEXT_X;
+            for (i, size) in &row.items {
+                paint_port(
+                    ui,
+                    Rect::from_min_size(Pos2::new(x, y), *size),
+                    &block.ports[*i].label(),
+                );
+                x += size.x + PORT_GAP;
             }
-            paint_port(
-                ui,
-                Rect::from_min_size(Pos2::new(x, piece.center().y - size.y / 2.0), size),
-                &port.label(),
-            );
-            x += size.x + 4.0;
+            y += PORT_H + PORT_GAP;
         }
-    }
-
-    // The spine down to the children.
-    if !block.children.is_empty() {
-        let spine_x = piece.left() + 6.0;
-        let bottom = piece.bottom() + TAB_H + 1.0;
-        let last_bottom = bottom + (block.children.len() as f32) * (PIECE_H + ROW_GAP);
-        ui.painter().line_segment(
-            [Pos2::new(spine_x, bottom), Pos2::new(spine_x, last_bottom)],
-            Stroke::new(1.5, Color32::from_rgb(100, 116, 139)),
-        );
     }
 
     let hover = format!(
@@ -219,8 +265,6 @@ fn paint_block(
         if !doc.node_id.is_empty() {
             requests.push(Request::OpenNode(doc.node_id.clone()));
         } else if !doc.location.is_empty() {
-            // `doc.line` is the declaration's first line; the block's line is
-            // 1-based *within the fragment*.
             let line = doc.line.max(1) + block.line as i64 - 1;
             let file = doc
                 .location
@@ -232,13 +276,25 @@ fn paint_block(
         }
     }
 
+    // Children, then the trunk down to the last one, so the line ends where the
+    // blocks actually end rather than at a guessed height.
     if !block.children.is_empty() {
+        let mut last: Option<Rect> = None;
         for (i, child) in block.children.iter().enumerate() {
             path.push(i);
-            paint_block(ui, doc, child, path, depth + 1, state, requests);
+            last = Some(paint_block(ui, doc, child, path, depth + 1, state, requests));
             path.pop();
         }
+        if let Some(last) = last {
+            let x = piece.left() + 6.0;
+            ui.painter().line_segment(
+                [Pos2::new(x, piece.bottom() + TAB_H), Pos2::new(x, last.center().y)],
+                Stroke::new(1.5, Color32::from_rgb(100, 116, 139)),
+            );
+        }
     }
+
+    piece
 }
 
 /// The piece itself: rounded body, a notch cut out of the top-left, a tab below.
@@ -268,23 +324,11 @@ fn paint_piece(ui: &mut egui::Ui, rect: Rect, fill: Color32, selected: bool) {
     }
 }
 
-/// Width of one piece for a given text and port run.
-///
-/// This is the bug that made every port pill invisible in the first desktop
-/// run: the text offset was counted twice, so the port row started past the
-/// piece's right edge and the paint loop broke on its very first port. The
-/// arithmetic is a named function now, and the test below pins it.
-fn piece_width(text_w: f32, ports_w: f32, avail: f32, indent: f32) -> f32 {
-    let ports_gap = if ports_w > 0.0 { 10.0 } else { 0.0 };
-    let wanted = TEXT_X + text_w + ports_gap + ports_w + PAD;
-    wanted.max(150.0).min((avail - indent).max(120.0))
-}
-
 fn port_size(ui: &egui::Ui, port: &crate::scratch::Port) -> Vec2 {
     let g = ui
         .painter()
-        .layout_no_wrap(port.label(), FontId::monospace(11.0), INK);
-    Vec2::new(g.size().x + 14.0, 18.0)
+        .layout_no_wrap(port.label(), FontId::monospace(PORT_FONT), INK);
+    Vec2::new(g.size().x + 14.0, PORT_H)
 }
 
 fn paint_port(ui: &mut egui::Ui, rect: Rect, label: &str) {
@@ -294,7 +338,7 @@ fn paint_port(ui: &mut egui::Ui, rect: Rect, label: &str) {
         rect.center(),
         Align2::CENTER_CENTER,
         label,
-        FontId::monospace(11.0),
+        FontId::monospace(PORT_FONT),
         INK,
     );
 }
@@ -316,18 +360,6 @@ pub fn error(ui: &mut egui::Ui, message: &str) {
     ui.add_space(8.0);
     ui.colored_label(Color32::from_rgb(248, 113, 113), message);
 }
-
-fn truncate(s: &str, max_chars: usize) -> String {
-    let mut out: String = s.chars().take(max_chars).collect();
-    if s.chars().count() > max_chars {
-        out.push('…');
-    }
-    out.replace('\n', " ")
-}
-
-/// Keep the paint helpers honest about being reachable from the tests.
-#[allow(dead_code)]
-fn _assert_types(_: Response) {}
 
 #[cfg(test)]
 mod tests {
@@ -368,14 +400,57 @@ mod tests {
         assert_eq!(doc.count(), 3);
     }
 
+    /// The long declaration from the desktop run
+    /// (`[UnityEngine.Tooltip("…")] public …`) must wrap into several lines
+    /// instead of being cut off at the piece's edge.
     #[test]
-    fn empty_and_error_states_render() {
+    fn a_long_line_wraps_instead_of_being_cut_off() {
+        let long = format!(
+            "[UnityEngine.Tooltip(\"{}\")]\npublic string {}\n{{ }}",
+            "Display name. Leave empty to derive it from the target.".repeat(2),
+            "SomeVeryLongMemberNameThatWouldOtherwiseBeCutOff"
+        );
+        let doc = doc(&long);
+        let mut state = GuiState::new();
         let ctx = egui::Context::default();
-        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-            super::empty(ui, "Nothing is being viewed.");
-            super::error(ui, "the viewed text produced no blocks");
-        });
+        let budget = text_max_width(700.0, 0.0);
+        let mut rows = 0usize;
+        let mut widest = 0.0f32;
+        let mut out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(700.0, 800.0))),
+                ..Default::default()
+            },
+            |ui| {
+                super::ui(ui, &doc, &mut state);
+                let text = doc.blocks[0].text();
+                let g = ui.painter().layout(
+                    text,
+                    FontId::monospace(BODY_FONT),
+                    INK,
+                    budget,
+                );
+                rows = g.rows.len();
+                widest = g.size().x;
+            },
+        );
         out.textures_delta.clear();
+        assert!(rows > 1, "a long declaration must wrap, not truncate (rows: {rows})");
+        assert!(
+            widest <= budget + 1.0,
+            "wrapped text stays inside its budget ({widest} vs {budget})"
+        );
+    }
+
+    #[test]
+    fn ports_pack_into_rows_that_fit() {
+        let sizes = vec![Vec2::new(40.0, PORT_H); 5];
+        let rows = pack_ports(&sizes, 100.0);
+        assert_eq!(rows.len(), 3, "40+4+40 fits in 100, so 2/2/1");
+        for row in &rows {
+            assert!(row.width <= 100.0, "a row never exceeds the text width");
+        }
+        assert_eq!(rows.iter().map(|r| r.items.len()).sum::<usize>(), 5);
     }
 
     #[test]
@@ -389,30 +464,13 @@ mod tests {
         assert_eq!(deduped.len(), kinds.len(), "colours must identify the kind");
     }
 
-    /// The port row must start inside the piece and end before its right edge
-    /// whenever the piece is not width-clamped.
     #[test]
-    fn ports_fit_inside_an_unclamped_piece() {
-        let (text_w, ports_w, avail, indent) = (120.0_f32, 64.0_f32, 1100.0_f32, 0.0_f32);
-        let width = piece_width(text_w, ports_w, avail, indent);
-        let ports_x = TEXT_X + text_w + 10.0;
-        assert!(ports_x + ports_w <= width, "ports end inside the piece");
-        assert!(width <= avail, "the piece fits the row");
-    }
-
-    /// A clamped piece squeezes the text, never the arithmetic: the paint loop
-    /// drops ports that would spill rather than drawing over the edge.
-    #[test]
-    fn a_clamped_piece_is_never_wider_than_the_row() {
-        let width = piece_width(900.0, 200.0, 300.0, 40.0);
-        assert!(width <= 300.0 - 40.0);
-    }
-
-    #[test]
-    fn long_text_is_truncated_not_overflowing() {
-        let long = "x".repeat(400);
-        let t = truncate(&long, 110);
-        assert_eq!(t.chars().count(), 111, "110 chars + the ellipsis");
-        assert!(t.ends_with('…'));
+    fn empty_and_error_states_render() {
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            super::empty(ui, "Nothing is being viewed.");
+            super::error(ui, "the viewed text produced no blocks");
+        });
+        out.textures_delta.clear();
     }
 }
