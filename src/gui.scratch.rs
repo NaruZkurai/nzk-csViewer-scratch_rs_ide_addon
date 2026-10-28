@@ -3,29 +3,33 @@
 //! Everything visual about the Scratch pane lives here, and nothing else does:
 //! the model is `scratch.rs`, the input is `idelink.scratch.rs`. The painter is
 //! a pure function of `(&ScratchDoc, &mut GuiState)` plus egui's frame, so the
-//! only state it owns is what the *user* changed (selection, which port pills
-//! are shown).
+//! only state it owns is what the *user* changed (selection, port toggle, theme).
 //!
 //! # The piece
 //!
 //! ```text
-//!    ╭─╮──────────────────────╮     ← the notch is a bg-coloured circle cut
-//!    │ ╰ if (n <= 0)          │       into the top-left corner
-//!    │   return;              │     ← text WRAPS; a piece grows downward
-//!    │   [condition: bool]    │     ← ports sit on their own row(s) below it
+//!    ╭─╮──────────────────────╮     ← notch cut out of the top-left corner
+//!    ┃ if (n <= 0)            │     ← a coloured stripe names the kind; the
+//!    ┃   return;              │       body stays the theme's surface colour
+//!    ┃   [condition: bool]    │     ← ports sit on their own row(s) below it
 //!    ╰───╮────────────────────╯
 //!        ╰─╯                        ← the tab is the same fill, below the body
 //! ```
 //!
+//! # Colour comes from the theme, not from a rainbow
+//!
+//! The first palette filled every piece with a saturated pastel. That reads as
+//! noise over real code, so it is gone: a piece is painted in the **host's
+//! surface colour** and the *kind* is a 4 px stripe in the theme's own colour
+//! for that kind (`Palette::accent`). Text, ports and selection likewise come
+//! from `egui::Visuals`, so switching the app theme switches the pane.
+//!
 //! # Two rules learned the hard way
 //!
-//! * **Nothing is cut off.** The first build clamped a piece to one row and
-//!   painted `…` over the tail (`[UnityEngine.Tooltip("Display name…")] public…`
-//!   on the desktop). Text is now laid out with a wrap width, so the piece grows
-//!   instead of hiding the author's code.
+//! * **Nothing is cut off.** Text is laid out with a wrap width, so the piece
+//!   grows instead of hiding the author's code.
 //! * **A port row always fits.** Ports are packed into rows against the piece's
-//!   own width; the earlier build started the row past the right edge and the
-//!   paint loop broke on its first pill (no pill was ever visible).
+//!   own width rather than starting past its right edge.
 //!
 //! # What it never does
 //!
@@ -38,14 +42,14 @@ use egui::{
 };
 
 use crate::idelink_scratch::{Request, ScratchDoc};
-use crate::scratch::Block;
+use crate::scratch::{Block, BlockKind};
 
 /// Room the next piece leaves for this one's tab.
 const ROW_GAP: f32 = 9.0;
 const INDENT: f32 = 20.0;
 const PAD: f32 = 10.0;
 const NOTCH_R: f32 = 6.0;
-/// Where the text starts, past the notch cut.
+/// Where the text starts, past the notch cut and the kind stripe.
 const TEXT_X: f32 = 18.0;
 const TAB_W: f32 = 14.0;
 const TAB_H: f32 = 9.0;
@@ -56,6 +60,90 @@ const PORT_GAP: f32 = 4.0;
 const PORTS_TOP: f32 = 6.0;
 const MIN_PIECE_W: f32 = 150.0;
 const MIN_PIECE_H: f32 = 30.0;
+/// Width of the kind stripe on a piece's left edge.
+const STRIPE_W: f32 = 4.0;
+const BODY_FONT: f32 = 13.0;
+const PORT_FONT: f32 = 11.0;
+
+/// The host's theme, mirrored so the pane can pick the same accents.
+///
+/// The variants are named after `cs viewer`'s `UiTheme`; this crate does not
+/// depend on the host, so the mapping is the host's one line of glue.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Theme {
+    #[default]
+    NzkDarkPlus,
+    DarkV1,
+}
+
+impl Theme {
+    fn rgb(c: u32) -> Color32 {
+        Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
+    }
+
+    /// The stripe colour for one block kind, taken from the theme's own node
+    /// palette (never an invented hue).
+    pub fn accent(self, kind: BlockKind) -> Color32 {
+        let c = match (self, kind) {
+            (Theme::NzkDarkPlus, BlockKind::Namespace) => 0x4ec9b0,
+            (Theme::NzkDarkPlus, BlockKind::Type) => 0x86c691,
+            (Theme::NzkDarkPlus, BlockKind::Method) => 0xdcdcaa,
+            (Theme::NzkDarkPlus, BlockKind::Property) => 0x9cdcfe,
+            (Theme::NzkDarkPlus, BlockKind::Control) => 0xc586c0,
+            (Theme::NzkDarkPlus, BlockKind::Keyword) => 0xce9178,
+            (Theme::NzkDarkPlus, BlockKind::Simple) => 0x859191,
+            (Theme::NzkDarkPlus, BlockKind::Directive) => 0x6a737d,
+            (Theme::DarkV1, BlockKind::Namespace) => 0x86aaf9,
+            (Theme::DarkV1, BlockKind::Type) => 0x42c3d0,
+            (Theme::DarkV1, BlockKind::Method) => 0xfa903e,
+            (Theme::DarkV1, BlockKind::Property) => 0x9db8f0,
+            (Theme::DarkV1, BlockKind::Control) => 0xd272ff,
+            (Theme::DarkV1, BlockKind::Keyword) => 0xf48385,
+            (Theme::DarkV1, BlockKind::Simple) => 0x9aa6c2,
+            (Theme::DarkV1, BlockKind::Directive) => 0x7a86a8,
+        };
+        Theme::rgb(c)
+    }
+}
+
+/// Every colour a piece needs, derived from the live `egui::Visuals` plus the
+/// theme's accents. Built once per frame; no statics, so a theme switch is a
+/// repaint away.
+#[derive(Clone, Copy, Debug)]
+pub struct Palette {
+    pub body: Color32,
+    pub body_selected: Color32,
+    pub ink: Color32,
+    pub ink_dim: Color32,
+    pub port_bg: Color32,
+    pub port_ink: Color32,
+    /// Background behind the notch, so the cut looks cut.
+    pub chassis: Color32,
+    pub border: Color32,
+    pub trunk: Color32,
+    pub theme: Theme,
+}
+
+impl Palette {
+    pub fn new(theme: Theme, v: &egui::Visuals) -> Palette {
+        Palette {
+            body: v.widgets.noninteractive.bg_fill,
+            body_selected: v.selection.bg_fill,
+            ink: v.text_color(),
+            ink_dim: v.weak_text_color(),
+            port_bg: v.widgets.inactive.bg_fill,
+            port_ink: v.weak_text_color(),
+            chassis: v.panel_fill,
+            border: v.widgets.noninteractive.bg_stroke.color,
+            trunk: v.widgets.noninteractive.bg_stroke.color,
+            theme,
+        }
+    }
+
+    pub fn accent(&self, kind: BlockKind) -> Color32 {
+        self.theme.accent(kind)
+    }
+}
 
 /// GUI-local state: what the user changed, nothing derived.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -64,38 +152,20 @@ pub struct GuiState {
     pub selected: Option<Vec<usize>>,
     /// Paint the typed port pills. On by default: the ports are the point.
     pub show_ports: bool,
+    /// The host's theme; the painter takes its accents from here.
+    pub theme: Theme,
 }
 
 impl GuiState {
     pub fn new() -> GuiState {
-        GuiState { selected: None, show_ports: true }
+        GuiState { selected: None, show_ports: true, theme: Theme::default() }
     }
 }
-
-/// The fill for one block kind. Bright, low-saturation pieces with dark text so
-/// a port pill stays readable on top.
-pub fn block_color(kind: crate::scratch::BlockKind) -> Color32 {
-    use crate::scratch::BlockKind::*;
-    match kind {
-        Namespace => Color32::from_rgb(196, 181, 253),
-        Type => Color32::from_rgb(153, 226, 214),
-        Method => Color32::from_rgb(147, 197, 253),
-        Property => Color32::from_rgb(253, 211, 138),
-        Control => Color32::from_rgb(255, 232, 138),
-        Keyword => Color32::from_rgb(249, 168, 212),
-        Simple => Color32::from_rgb(203, 213, 225),
-        Directive => Color32::from_rgb(148, 163, 184),
-    }
-}
-
-/// Text on a piece. Dark on every fill above.
-const INK: Color32 = Color32::from_rgb(24, 28, 38);
-const BODY_FONT: f32 = 13.0;
-const PORT_FONT: f32 = 11.0;
 
 /// Paint the whole document and return the requests the user's clicks made.
 pub fn ui(ui: &mut egui::Ui, doc: &ScratchDoc, state: &mut GuiState) -> Vec<Request> {
     let mut requests = Vec::new();
+    let palette = Palette::new(state.theme, ui.visuals());
 
     header(ui, doc, state);
 
@@ -111,7 +181,7 @@ pub fn ui(ui: &mut egui::Ui, doc: &ScratchDoc, state: &mut GuiState) -> Vec<Requ
             let mut path = Vec::new();
             for (i, block) in doc.blocks.iter().enumerate() {
                 path.push(i);
-                paint_block(ui, doc, block, &mut path, 0, state, &mut requests);
+                paint_block(ui, doc, block, &mut path, 0, state, &palette, &mut requests);
                 path.pop();
             }
         });
@@ -129,11 +199,7 @@ fn header(ui: &mut egui::Ui, doc: &ScratchDoc, state: &mut GuiState) {
     ui.horizontal(|ui| {
         ui.heading(if doc.title.is_empty() { "Scratch" } else { &doc.title });
         ui.add_space(6.0);
-        ui.label(
-            egui::RichText::new("read-only")
-                .small()
-                .color(Color32::from_rgb(148, 163, 184)),
-        );
+        ui.label(egui::RichText::new("read-only").small().color(ui.visuals().weak_text_color()));
     });
     // The shared IDE context strip (`gui.nzkide`): breadcrumb + live state. The
     // Scratch window is a view of what the IDE is looking at, and this is where
@@ -155,9 +221,6 @@ struct PortRow {
 }
 
 /// Pack pills into rows no wider than `max_w`.
-///
-/// A pill wider than the row occupies a row alone (it is clipped by the piece's
-/// own width, never by arithmetic that starts it outside the piece).
 fn pack_ports(sizes: &[Vec2], max_w: f32) -> Vec<PortRow> {
     let mut rows: Vec<PortRow> = Vec::new();
     let mut current = PortRow { items: Vec::new(), width: 0.0 };
@@ -193,6 +256,7 @@ fn ports_height(rows: usize) -> f32 {
 }
 
 /// Draw one piece and its children; returns the piece's rectangle.
+#[allow(clippy::too_many_arguments)]
 fn paint_block(
     ui: &mut egui::Ui,
     doc: &ScratchDoc,
@@ -200,6 +264,7 @@ fn paint_block(
     path: &mut Vec<usize>,
     depth: usize,
     state: &mut GuiState,
+    palette: &Palette,
     requests: &mut Vec<Request>,
 ) -> Rect {
     let avail = ui.available_width();
@@ -207,9 +272,8 @@ fn paint_block(
     let max_w = (avail - indent).max(120.0);
     let text_max = text_max_width(avail, indent);
 
-    // Wrap, never truncate: the piece grows downward instead of hiding text.
     let font = FontId::monospace(BODY_FONT);
-    let galley = ui.painter().layout(block.text(), font, INK, text_max);
+    let galley = ui.painter().layout(block.text(), font, palette.ink, text_max);
     let text_w = galley.size().x;
 
     let port_sizes: Vec<Vec2> = if state.show_ports {
@@ -224,16 +288,16 @@ fn paint_block(
     let width = (TEXT_X + text_w.max(ports_w) + PAD).max(MIN_PIECE_W).min(max_w);
     let height = (PAD * 0.6 + galley.size().y + ports_h + PAD * 0.6).max(MIN_PIECE_H);
 
-    let (row, resp) =
-        ui.allocate_exact_size(Vec2::new(avail, height + ROW_GAP), Sense::click());
+    let (row, resp) = ui.allocate_exact_size(Vec2::new(avail, height + ROW_GAP), Sense::click());
     let piece = Rect::from_min_size(row.min + Vec2::new(indent, 0.0), Vec2::new(width, height));
 
     let selected = state.selected.as_deref() == Some(path.as_slice());
-    paint_piece(ui, piece, block_color(block.kind), selected);
+    let accent = palette.accent(block.kind);
+    paint_piece(ui, piece, accent, palette, selected);
 
     let text_pos = Pos2::new(piece.left() + TEXT_X, piece.top() + PAD * 0.6);
     let text_h = galley.size().y;
-    ui.painter().galley(text_pos, galley, INK);
+    ui.painter().galley(text_pos, galley, palette.ink);
 
     if !rows.is_empty() {
         let mut y = text_pos.y + text_h + PORTS_TOP;
@@ -244,6 +308,7 @@ fn paint_block(
                     ui,
                     Rect::from_min_size(Pos2::new(x, y), *size),
                     &block.ports[*i].label(),
+                    palette,
                 );
                 x += size.x + PORT_GAP;
             }
@@ -283,14 +348,19 @@ fn paint_block(
         let mut last: Option<Rect> = None;
         for (i, child) in block.children.iter().enumerate() {
             path.push(i);
-            last = Some(paint_block(ui, doc, child, path, depth + 1, state, requests));
+            last = Some(paint_block(
+                ui, doc, child, path, depth + 1, state, palette, requests,
+            ));
             path.pop();
         }
         if let Some(last) = last {
             let x = piece.left() + 6.0;
             ui.painter().line_segment(
-                [Pos2::new(x, piece.bottom() + TAB_H), Pos2::new(x, last.center().y)],
-                Stroke::new(1.5, Color32::from_rgb(100, 116, 139)),
+                [
+                    Pos2::new(x, piece.bottom() + TAB_H),
+                    Pos2::new(x, last.center().y),
+                ],
+                Stroke::new(1.5, palette.trunk),
             );
         }
     }
@@ -298,11 +368,11 @@ fn paint_block(
     piece
 }
 
-/// The piece itself: rounded body, a notch cut out of the top-left, a tab below.
-fn paint_piece(ui: &mut egui::Ui, rect: Rect, fill: Color32, selected: bool) {
+/// The piece itself: theme surface, a kind stripe on the left, a notch and a tab.
+fn paint_piece(ui: &mut egui::Ui, rect: Rect, accent: Color32, palette: &Palette, selected: bool) {
     let painter = ui.painter();
-    let bg = ui.visuals().panel_fill;
     let radius = CornerRadius::same(7);
+    let fill = if selected { palette.body_selected } else { palette.body };
 
     // Tab first, so the body's own rounded corner overlaps it cleanly.
     let tab = Rect::from_min_size(
@@ -312,35 +382,41 @@ fn paint_piece(ui: &mut egui::Ui, rect: Rect, fill: Color32, selected: bool) {
     painter.rect_filled(tab, CornerRadius::same(4), fill);
 
     painter.rect_filled(rect, radius, fill);
-    // The notch: a circle of the panel colour, cutting into the top edge.
-    painter.circle_filled(Pos2::new(rect.left() + 15.0, rect.top()), NOTCH_R, bg);
 
-    if selected {
-        painter.rect_stroke(
-            rect,
-            radius,
-            Stroke::new(2.0, Color32::from_rgb(56, 189, 248)),
-            StrokeKind::Outside,
-        );
-    }
+    // The kind stripe: the only saturated colour on a piece, 4 px wide.
+    let stripe = Rect::from_min_max(
+        Pos2::new(rect.left() + 1.0, rect.top() + 5.0),
+        Pos2::new(rect.left() + 1.0 + STRIPE_W, rect.bottom() - 5.0),
+    );
+    painter.rect_filled(stripe, CornerRadius::same(2), accent);
+
+    // The notch: a circle of the panel colour, cutting into the top edge.
+    painter.circle_filled(Pos2::new(rect.left() + 15.0, rect.top()), NOTCH_R, palette.chassis);
+
+    let stroke = if selected {
+        Stroke::new(1.5, accent)
+    } else {
+        Stroke::new(1.0, palette.border)
+    };
+    painter.rect_stroke(rect, radius, stroke, StrokeKind::Inside);
 }
 
 fn port_size(ui: &egui::Ui, port: &crate::scratch::Port) -> Vec2 {
     let g = ui
         .painter()
-        .layout_no_wrap(port.label(), FontId::monospace(PORT_FONT), INK);
+        .layout_no_wrap(port.label(), FontId::monospace(PORT_FONT), Color32::PLACEHOLDER);
     Vec2::new(g.size().x + 14.0, PORT_H)
 }
 
-fn paint_port(ui: &mut egui::Ui, rect: Rect, label: &str) {
+fn paint_port(ui: &mut egui::Ui, rect: Rect, label: &str, palette: &Palette) {
     let painter = ui.painter();
-    painter.rect_filled(rect, CornerRadius::same(9), Color32::from_black_alpha(38));
+    painter.rect_filled(rect, CornerRadius::same(9), palette.port_bg);
     painter.text(
         rect.center(),
         Align2::CENTER_CENTER,
         label,
         FontId::monospace(PORT_FONT),
-        INK,
+        palette.port_ink,
     );
 }
 
@@ -386,8 +462,6 @@ mod tests {
         }
     }
 
-    /// The painter must not panic on a real document, a deep one, or an empty
-    /// one. This runs egui headlessly, so it exercises the real `ui` pass.
     #[test]
     fn renders_headlessly() {
         let doc = doc("void A() {\n  if (x) {\n    Go(1);\n  }\n}");
@@ -397,7 +471,7 @@ mod tests {
             let reqs = super::ui(ui, &doc, &mut state);
             assert!(reqs.is_empty(), "no clicks in a headless frame");
         });
-        out.textures_delta.clear(); // nothing uploads textures in a headless pass
+        out.textures_delta.clear();
         assert_eq!(doc.count(), 3);
     }
 
@@ -425,12 +499,9 @@ mod tests {
             |ui| {
                 super::ui(ui, &doc, &mut state);
                 let text = doc.blocks[0].text();
-                let g = ui.painter().layout(
-                    text,
-                    FontId::monospace(BODY_FONT),
-                    INK,
-                    budget,
-                );
+                let g = ui
+                    .painter()
+                    .layout(text, FontId::monospace(BODY_FONT), Color32::WHITE, budget);
                 rows = g.rows.len();
                 widest = g.size().x;
             },
@@ -454,15 +525,32 @@ mod tests {
         assert_eq!(rows.iter().map(|r| r.items.len()).sum::<usize>(), 5);
     }
 
+    /// A piece is painted in the theme's surface colour; the kind is a stripe.
+    /// This is the property that replaced the rainbow fills.
     #[test]
-    fn every_kind_has_a_distinct_fill() {
-        use crate::scratch::BlockKind::*;
-        let kinds = [Namespace, Type, Method, Property, Control, Keyword, Simple, Directive];
-        let colors: Vec<Color32> = kinds.iter().map(|k| block_color(*k)).collect();
-        let mut deduped = colors.clone();
-        deduped.sort_by_key(|c| c.to_array());
-        deduped.dedup();
-        assert_eq!(deduped.len(), kinds.len(), "colours must identify the kind");
+    fn the_palette_is_the_theme_surface_not_a_bright_fill() {
+        let v = egui::Visuals::dark();
+        let p = Palette::new(Theme::NzkDarkPlus, &v);
+        assert_eq!(p.body, v.widgets.noninteractive.bg_fill);
+        assert_eq!(p.ink, v.text_color());
+        assert_eq!(p.chassis, v.panel_fill);
+        // Every stripe is distinct per kind, per theme.
+        for theme in [Theme::NzkDarkPlus, Theme::DarkV1] {
+            let kinds = [
+                BlockKind::Namespace,
+                BlockKind::Type,
+                BlockKind::Method,
+                BlockKind::Property,
+                BlockKind::Control,
+                BlockKind::Keyword,
+                BlockKind::Simple,
+                BlockKind::Directive,
+            ];
+            let mut accents: Vec<[u8; 4]> = kinds.iter().map(|k| theme.accent(*k).to_array()).collect();
+            accents.sort();
+            accents.dedup();
+            assert_eq!(accents.len(), kinds.len(), "accents must identify the kind");
+        }
     }
 
     #[test]
