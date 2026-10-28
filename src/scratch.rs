@@ -585,7 +585,7 @@ fn control_ports(head: &str, body: &str) -> Vec<Port> {
                     ports.push(Port { name: "condition".into(), ty: Some("bool".into()), dir: PortDir::In });
                 }
             }
-            if let Some(iter) = parts.get(2).map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if parts.get(2).map(|s| s.trim()).is_some_and(|s| !s.is_empty()) {
                 ports.push(Port { name: "iterate".into(), ty: None, dir: PortDir::In });
             }
             ports
