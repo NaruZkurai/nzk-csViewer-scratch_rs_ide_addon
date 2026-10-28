@@ -104,6 +104,13 @@ impl Port {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Block {
     pub kind: BlockKind,
+    /// Leading `[Attribute(…)]` runs that annotate this declaration, verbatim
+    /// and space-joined. Empty when there are none.
+    ///
+    /// Kept apart from `head` so the *construct* is what classifies the block:
+    /// `[SerializeField] private int count` is a `private int count` block with
+    /// an attribute, not an attribute block owning a field.
+    pub attrs: String,
     /// The construct itself: `if`, `class Foo`, `public void Bar`.
     pub head: String,
     /// The remainder of the statement: `(x > 0)`, `= 5`, `(int n)`.
@@ -120,11 +127,17 @@ pub struct Block {
 impl Block {
     /// The full one-line text of this block, without its children.
     pub fn text(&self) -> String {
-        if self.body.is_empty() {
-            self.head.clone()
-        } else {
-            format!("{} {}", self.head, self.body)
+        let mut out = String::new();
+        if !self.attrs.is_empty() {
+            out.push_str(&self.attrs);
+            out.push(' ');
         }
+        out.push_str(&self.head);
+        if !self.body.is_empty() {
+            out.push(' ');
+            out.push_str(&self.body);
+        }
+        out
     }
 
     /// Total blocks in this subtree, including this one.
@@ -449,9 +462,60 @@ impl Scan {
 
 /// Build one block from its header text (and already-parsed children).
 fn make_block(header: &str, children: Vec<Block>, closed: bool, line: usize, sig: &Signature) -> Block {
-    let (kind, head, body) = classify(header, !children.is_empty());
+    // `[SerializeField] private int count` is a field with an attribute, so the
+    // attribute run is peeled off BEFORE the construct is classified and its
+    // ports read. It is still shown, just not allowed to own the block.
+    let (attrs, rest) = split_leading_attributes(header);
+    let (kind, head, body) = classify(rest, !children.is_empty());
     let ports = ports_for(kind, &head, &body, sig);
-    Block { kind, head, body, ports, children, line, closed }
+    Block { kind, attrs, head, body, ports, children, line, closed }
+}
+
+/// Peel leading `[ … ]` attribute runs off a declaration header.
+///
+/// Returns `(joined_attrs, rest)`. Bracket matching honours strings, so
+/// `[Tooltip("a]b")]` stays one attribute.
+fn split_leading_attributes(header: &str) -> (String, &str) {
+    let mut attrs: Vec<String> = Vec::new();
+    let mut rest = header.trim_start();
+    while rest.starts_with('[') {
+        let chars: Vec<char> = rest.chars().collect();
+        let mut depth = 0i32;
+        let mut in_str: Option<char> = None;
+        let mut end = None;
+        let mut i = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if let Some(q) = in_str {
+                if c == '\\' && q != '\'' {
+                    i += 2;
+                    continue;
+                }
+                if c == q {
+                    in_str = None;
+                }
+                i += 1;
+                continue;
+            }
+            match c {
+                '"' | '\'' => in_str = Some(c),
+                '[' => depth += 1,
+                ']' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(char_index_to_byte(rest, i));
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let Some(end) = end else { break };
+        attrs.push(rest[..=end].trim().to_string());
+        rest = rest[end + 1..].trim_start();
+    }
+    (attrs.join(" "), rest)
 }
 
 /// Split a header into its construct, the rest, and what kind of block it is.
@@ -460,8 +524,18 @@ fn classify(header: &str, has_children: bool) -> (BlockKind, String, String) {
     if t.is_empty() {
         return (BlockKind::Simple, "{}".to_string(), String::new());
     }
-    let word = leading_word(t);
-    let rest = t[word.len()..].trim().to_string();
+    // `public class Foo` names a class, not a "public": skip the modifiers
+    // before the construct keyword is read, but keep `t` intact for the
+    // method/simple fallbacks (they need the modifiers to find the return type).
+    let mut after_mods = t;
+    let mut word = leading_word(after_mods);
+    let mut skipped = 0;
+    while is_modifier(&word) && skipped < 8 {
+        after_mods = after_mods[word.len()..].trim_start();
+        word = leading_word(after_mods);
+        skipped += 1;
+    }
+    let rest = after_mods[word.len()..].trim().to_string();
     let kind = match word.as_str() {
         "namespace" => BlockKind::Namespace,
         "class" | "struct" | "interface" | "enum" | "record" | "delegate" => BlockKind::Type,
@@ -663,14 +737,20 @@ fn method_return(head: &str) -> Option<String> {
     if ty.is_empty() { None } else { Some(ty) }
 }
 
+/// C# member/type modifiers, which never name the construct themselves.
+pub const MODIFIERS: [&str; 20] = [
+    "public", "private", "protected", "internal", "static", "virtual", "override",
+    "abstract", "sealed", "async", "extern", "unsafe", "new", "partial", "readonly",
+    "const", "volatile", "required", "file", "ref",
+];
+
+fn is_modifier(word: &str) -> bool {
+    MODIFIERS.contains(&word)
+}
+
 fn strip_modifiers(t: &str) -> Vec<String> {
-    const MODS: [&str; 20] = [
-        "public", "private", "protected", "internal", "static", "virtual", "override",
-        "abstract", "sealed", "async", "extern", "unsafe", "new", "partial", "readonly",
-        "const", "volatile", "required", "file", "ref",
-    ];
     t.split_whitespace()
-        .filter(|w| !MODS.contains(&w.trim()))
+        .filter(|w| !is_modifier(w.trim()))
         .map(|w| w.trim().to_string())
         .filter(|w| !w.is_empty())
         .collect()
@@ -1021,6 +1101,32 @@ class Foo {
         assert_eq!(cls.children[0].ports[0].ty.as_deref(), Some("int"));
         assert_eq!(cls.children[1].ports[0].name, "Count");
         assert_eq!(cls.children[2].kind, BlockKind::Method);
+    }
+
+    #[test]
+    fn attributes_annotate_the_declaration_instead_of_owning_it() {
+        let src = "[SerializeField]\n[Tooltip(\"a]b\")]\nprivate int count = 0;";
+        let p = parse(src, &Signature::default());
+        assert_eq!(p.blocks.len(), 1, "one field, not an attribute block");
+        let b = &p.blocks[0];
+        assert_eq!(b.kind, BlockKind::Simple);
+        assert_eq!(b.attrs, "[SerializeField] [Tooltip(\"a]b\")]");
+        assert_eq!(b.head, "private int count = 0");
+        assert_eq!(b.ports[0].name, "count");
+        assert_eq!(b.ports[0].ty.as_deref(), Some("int"));
+        assert!(b.text().starts_with("[SerializeField]"), "the attribute is still shown");
+    }
+
+    #[test]
+    fn an_attributed_class_keeps_its_body() {
+        let p = parse("[UnityEngine.AddComponentMenu(\"X\")]\npublic class Foo { void A() { } }", &Signature::default());
+        assert_eq!(p.blocks.len(), 1);
+        let c = &p.blocks[0];
+        assert_eq!(c.kind, BlockKind::Type);
+        assert_eq!(c.head, "class");
+        assert_eq!(c.body, "Foo");
+        assert_eq!(c.attrs, "[UnityEngine.AddComponentMenu(\"X\")]");
+        assert_eq!(c.children.len(), 1);
     }
 
     #[test]

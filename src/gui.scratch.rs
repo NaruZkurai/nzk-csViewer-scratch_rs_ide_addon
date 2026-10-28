@@ -40,6 +40,8 @@ const ROW_GAP: f32 = 9.0;
 const INDENT: f32 = 20.0;
 const PAD: f32 = 10.0;
 const NOTCH_R: f32 = 6.0;
+/// Where the text starts, past the notch cut.
+const TEXT_X: f32 = 18.0;
 const TAB_W: f32 = 14.0;
 const TAB_H: f32 = 9.0;
 
@@ -156,9 +158,7 @@ fn paint_block(
         0.0
     };
 
-    let width = (PAD * 2.0 + text_w + ports_w + 8.0)
-        .max(150.0)
-        .min((avail - indent).max(120.0));
+    let width = piece_width(text_w, ports_w, avail, indent);
     let (row, resp) = ui.allocate_exact_size(
         Vec2::new(avail, PIECE_H + ROW_GAP),
         Sense::click(),
@@ -170,7 +170,7 @@ fn paint_block(
     paint_piece(ui, piece, fill, selected);
 
     // Text, clipped to the piece.
-    let text_pos = Pos2::new(piece.left() + PAD + 10.0, piece.center().y);
+    let text_pos = Pos2::new(piece.left() + TEXT_X, piece.center().y);
     ui.painter().galley(
         text_pos - Vec2::new(0.0, galley.size().y / 2.0),
         galley,
@@ -178,7 +178,7 @@ fn paint_block(
     );
 
     if state.show_ports {
-        let mut x = piece.left() + PAD + 10.0 + text_w + 10.0;
+        let mut x = piece.left() + TEXT_X + text_w + 10.0;
         for port in &block.ports {
             let size = port_size(ui, port);
             if x + size.x > piece.right() - 4.0 {
@@ -266,6 +266,18 @@ fn paint_piece(ui: &mut egui::Ui, rect: Rect, fill: Color32, selected: bool) {
             StrokeKind::Outside,
         );
     }
+}
+
+/// Width of one piece for a given text and port run.
+///
+/// This is the bug that made every port pill invisible in the first desktop
+/// run: the text offset was counted twice, so the port row started past the
+/// piece's right edge and the paint loop broke on its very first port. The
+/// arithmetic is a named function now, and the test below pins it.
+fn piece_width(text_w: f32, ports_w: f32, avail: f32, indent: f32) -> f32 {
+    let ports_gap = if ports_w > 0.0 { 10.0 } else { 0.0 };
+    let wanted = TEXT_X + text_w + ports_gap + ports_w + PAD;
+    wanted.max(150.0).min((avail - indent).max(120.0))
 }
 
 fn port_size(ui: &egui::Ui, port: &crate::scratch::Port) -> Vec2 {
@@ -375,6 +387,25 @@ mod tests {
         deduped.sort_by_key(|c| c.to_array());
         deduped.dedup();
         assert_eq!(deduped.len(), kinds.len(), "colours must identify the kind");
+    }
+
+    /// The port row must start inside the piece and end before its right edge
+    /// whenever the piece is not width-clamped.
+    #[test]
+    fn ports_fit_inside_an_unclamped_piece() {
+        let (text_w, ports_w, avail, indent) = (120.0_f32, 64.0_f32, 1100.0_f32, 0.0_f32);
+        let width = piece_width(text_w, ports_w, avail, indent);
+        let ports_x = TEXT_X + text_w + 10.0;
+        assert!(ports_x + ports_w <= width, "ports end inside the piece");
+        assert!(width <= avail, "the piece fits the row");
+    }
+
+    /// A clamped piece squeezes the text, never the arithmetic: the paint loop
+    /// drops ports that would spill rather than drawing over the edge.
+    #[test]
+    fn a_clamped_piece_is_never_wider_than_the_row() {
+        let width = piece_width(900.0, 200.0, 300.0, 40.0);
+        assert!(width <= 300.0 - 40.0);
     }
 
     #[test]
