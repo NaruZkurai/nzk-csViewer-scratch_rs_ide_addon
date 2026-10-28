@@ -1,0 +1,17 @@
+[package]
+name = "scratch-rs-ide-addon"
+description = "Scratch-style puzzle-piece blocks for a C# IDE, rendered with egui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/naruzkurai/scratch_rs_ide_addon"
+
+# A plain library. The host IDE (`cs viewer v3`) takes it as a path dependency;
+# nothing in this crate knows about csgraph, an Index, or a GraphView. The two
+# files that talk to a host are `idelink.scratch.rs` (viewed code in) and
+# `idelink.nzkide.rs` (IDE context in) — both pure data.
+[dependencies]
+egui = { version = "0.37", default-features = false }
+
+[dev-dependencies]
+# Nothing beyond egui: the GUI smoke test runs `egui::Context` headlessly.
