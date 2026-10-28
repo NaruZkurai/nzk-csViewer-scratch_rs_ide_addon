@@ -84,6 +84,7 @@ pub fn block_color(kind: crate::scratch::BlockKind) -> Color32 {
         Control => Color32::from_rgb(255, 232, 138),
         Keyword => Color32::from_rgb(249, 168, 212),
         Simple => Color32::from_rgb(203, 213, 225),
+        Directive => Color32::from_rgb(148, 163, 184),
     }
 }
 
@@ -456,7 +457,7 @@ mod tests {
     #[test]
     fn every_kind_has_a_distinct_fill() {
         use crate::scratch::BlockKind::*;
-        let kinds = [Namespace, Type, Method, Property, Control, Keyword, Simple];
+        let kinds = [Namespace, Type, Method, Property, Control, Keyword, Simple, Directive];
         let colors: Vec<Color32> = kinds.iter().map(|k| block_color(*k)).collect();
         let mut deduped = colors.clone();
         deduped.sort_by_key(|c| c.to_array());

@@ -48,6 +48,9 @@ pub enum BlockKind {
     Keyword,
     /// Anything else that ends in `;` — a declaration, an assignment, a call.
     Simple,
+    /// A preprocessor line: `#if`, `#region`, `#pragma`, … Kept as its own
+    /// block so it cannot glue itself to the statement that follows it.
+    Directive,
 }
 
 impl BlockKind {
@@ -61,6 +64,7 @@ impl BlockKind {
             BlockKind::Control => "control",
             BlockKind::Keyword => "keyword",
             BlockKind::Simple => "simple",
+            BlockKind::Directive => "directive",
         }
     }
 }
@@ -242,11 +246,16 @@ impl Scan {
             }
             return;
         }
-        // Count the opening quote run: 1 = normal, 3+ = raw string literal.
+        // Count the opening quote run: 2 = the empty string, 1 = normal,
+        // 3+ = a raw string literal. Treating `""` as a raw opener was the bug
+        // that let `= "";` swallow every following field up to the next `""`.
         let mut quotes = 0usize;
         while self.peek() == Some('"') {
             out.push(self.bump().unwrap());
             quotes += 1;
+        }
+        if quotes == 2 {
+            return;
         }
         let close_run = quotes.max(1);
         let verbatim = out.trim_start_matches('$').starts_with('@');
@@ -347,7 +356,7 @@ pub fn parse(source: &str, sig: &Signature) -> Parsed {
     if source.trim().is_empty() {
         return out;
     }
-    let closed = scan.seq(&mut out.blocks, &mut out.warnings, sig, true);
+    let closed = scan.seq(&mut out.blocks, &mut out.warnings, sig, true, false);
     if !closed && !out.blocks.is_empty() {
         // Top level ending without a brace is normal; `seq` returns false at EOF.
     }
@@ -365,6 +374,7 @@ impl Scan {
         warnings: &mut Vec<String>,
         sig: &Signature,
         top: bool,
+        comma_ends_statement: bool,
     ) -> bool {
         loop {
             let mut text = String::new();
@@ -387,6 +397,22 @@ impl Scan {
                 }
                 self.push_leaf(out, sig, &text);
                 return true;
+            }
+
+            // A preprocessor directive owns its whole line. Scanning it as an
+            // ordinary statement was how `#if UNITY_EDITOR` ended up glued to
+            // `using static …` in the first real file.
+            if self.peek() == Some('#') && text.trim().is_empty() {
+                let start_line = self.line;
+                let mut dir = String::new();
+                while let Some(c) = self.bump() {
+                    if c == '\n' {
+                        break;
+                    }
+                    dir.push(c);
+                }
+                out.push(make_block(dir.trim(), Vec::new(), true, start_line, sig));
+                continue;
             }
 
             let start_line = self.line;
@@ -418,8 +444,15 @@ impl Scan {
                     '{' if paren <= 0 && brack <= 0 => {
                         self.bump();
                         let header = text.trim().to_string();
+                        // An enum body separates members with commas, not
+                        // semicolons; everything else uses `;`.
+                        let (attrs, rest) = split_leading_attributes(&header);
+                        let (hkind, hhead, _) = classify(rest, true);
+                        let is_enum = hkind == BlockKind::Type && hhead == "enum";
+                        let _ = attrs;
                         let mut children = Vec::new();
-                        let closed = self.seq(&mut children, warnings, sig, false);
+                        let closed =
+                            self.seq(&mut children, warnings, sig, false, is_enum);
                         if !closed {
                             warnings.push(format!(
                                 "line {start_line}: `{{` opened here is never closed"
@@ -437,7 +470,20 @@ impl Scan {
                         }
                         return true;
                     }
+                    // `case X:` / `default:` is a label, not a statement: end it
+                    // at its top-level colon so it cannot become the return type
+                    // of the call on the next line.
+                    ':' if paren <= 0 && brack <= 0 && is_case_label(&text) => {
+                        self.bump();
+                        self.push_leaf(out, sig, &text);
+                        break;
+                    }
                     ';' if paren <= 0 && brack <= 0 => {
+                        self.bump();
+                        self.push_leaf(out, sig, &text);
+                        break;
+                    }
+                    ',' if comma_ends_statement && paren <= 0 && brack <= 0 => {
                         self.bump();
                         self.push_leaf(out, sig, &text);
                         break;
@@ -466,8 +512,23 @@ fn make_block(header: &str, children: Vec<Block>, closed: bool, line: usize, sig
     // attribute run is peeled off BEFORE the construct is classified and its
     // ports read. It is still shown, just not allowed to own the block.
     let (attrs, rest) = split_leading_attributes(header);
-    let (kind, head, body) = classify(rest, !children.is_empty());
-    let ports = ports_for(kind, &head, &body, sig);
+    let (mut kind, head, body) = classify(rest, !children.is_empty());
+    // `public bool IsSound { get; }` has no parameter list, so `classify` sees a
+    // plain declaration; the accessor children are what make it a property.
+    if kind == BlockKind::Simple && children.iter().any(|c| c.kind == BlockKind::Property) {
+        kind = BlockKind::Property;
+        let ports = Vec::new();
+        return Block { kind, attrs, head, body, ports, children, line, closed };
+    }
+    let mut ports = ports_for(kind, &head, &body, sig);
+    let mut children = children;
+    if kind == BlockKind::Type && head == "enum" {
+        // `Sound = 0` is a value of `Kind`, not a typed declaration of its own.
+        for child in &mut children {
+            child.ports.clear();
+        }
+        ports.clear();
+    }
     Block { kind, attrs, head, body, ports, children, line, closed }
 }
 
@@ -524,6 +585,9 @@ fn classify(header: &str, has_children: bool) -> (BlockKind, String, String) {
     if t.is_empty() {
         return (BlockKind::Simple, "{}".to_string(), String::new());
     }
+    if t.starts_with('#') {
+        return (BlockKind::Directive, t.to_string(), String::new());
+    }
     // `public class Foo` names a class, not a "public": skip the modifiers
     // before the construct keyword is read, but keep `t` intact for the
     // method/simple fallbacks (they need the modifiers to find the return type).
@@ -539,6 +603,9 @@ fn classify(header: &str, has_children: bool) -> (BlockKind, String, String) {
     let kind = match word.as_str() {
         "namespace" => BlockKind::Namespace,
         "class" | "struct" | "interface" | "enum" | "record" | "delegate" => BlockKind::Type,
+        // `using (…) { }` is a statement; `using static Foo;` at file scope is a
+        // directive, and a leaf. Only a body makes it a control block.
+        "using" if !has_children => BlockKind::Simple,
         "if" | "else" | "for" | "foreach" | "while" | "do" | "switch" | "try" | "catch"
         | "finally" | "using" | "lock" | "fixed" | "unsafe" | "checked" | "unchecked" => {
             BlockKind::Control
@@ -564,6 +631,12 @@ fn classify(header: &str, has_children: bool) -> (BlockKind, String, String) {
         }
     };
     (kind, word, rest)
+}
+
+/// True when a statement so far is a `case …` / `default` label.
+fn is_case_label(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with("case ") || t == "default"
 }
 
 fn leading_word(t: &str) -> String {
@@ -627,8 +700,11 @@ fn ports_for(kind: BlockKind, head: &str, body: &str, sig: &Signature) -> Vec<Po
                 Vec::new()
             }
         }
-        BlockKind::Simple | BlockKind::Property => simple_ports(&format!("{head} {body}")),
-        BlockKind::Type | BlockKind::Namespace => Vec::new(),
+        // `get`/`set`/`add`/`remove`/`init` are accessor keywords, not a
+        // declaration: they have no ports of their own.
+        BlockKind::Property => Vec::new(),
+        BlockKind::Simple => simple_ports(&format!("{head} {body}")),
+        BlockKind::Type | BlockKind::Namespace | BlockKind::Directive => Vec::new(),
     }
 }
 
@@ -1189,6 +1265,69 @@ int F(bool b) {
     fn split_top_is_depth_aware() {
         assert_eq!(split_top("a, B<c, d>, e", ',').len(), 3);
         assert_eq!(split_top("f(x, y), z", ',').len(), 2);
+    }
+
+    #[test]
+    fn an_empty_string_does_not_swallow_the_next_declaration() {
+        // The desktop bug: `= "";` was read as the start of a raw string, so
+        // every following field vanished into one giant block.
+        let src = r#"class C { public string a = ""; public string b = ""; }"#;
+        let p = parse(src, &Signature::default());
+        let c = find(&p.blocks, "class").expect("class");
+        assert_eq!(c.children.len(), 2, "two fields, not one merged run");
+        assert_eq!(c.children[1].head, "public string b = \"\"");
+    }
+
+    #[test]
+    fn raw_string_literals_still_scan_to_their_own_run() {
+        let src = "var s = \"\"\"a;b{c}\nvoid inside\"\"\";\nvoid N() { }";
+        let p = parse(src, &Signature::default());
+        assert_eq!(p.blocks.len(), 2, "the raw literal ends at its 3-quote run");
+        assert_eq!(p.blocks[1].head, "void N");
+    }
+
+    #[test]
+    fn enum_members_are_separate_blocks() {
+        let p = parse("public enum Kind { Sound = 0, Object = 1 }", &Signature::default());
+        let e = find(&p.blocks, "enum").expect("enum");
+        assert_eq!(e.kind, BlockKind::Type);
+        assert_eq!(e.children.len(), 2, "members split on top-level commas");
+        assert_eq!(e.children[0].head, "Sound = 0");
+        assert_eq!(e.children[1].head, "Object = 1");
+        assert!(e.children.iter().all(|c| c.ports.is_empty()), "an enum value has no port");
+    }
+
+    #[test]
+    fn accessors_carry_no_ports_and_make_a_property() {
+        let p = parse(
+            "public bool IsSound { get { return true; } set { } }",
+            &Signature::default(),
+        );
+        let b = &p.blocks[0];
+        assert_eq!(b.kind, BlockKind::Property, "accessor children make it a property");
+        assert!(b.ports.is_empty(), "a property is not a parameter list");
+        assert_eq!(b.children[0].kind, BlockKind::Property);
+        assert!(b.children[0].ports.is_empty(), "`get` has no `: ?` port");
+    }
+
+    #[test]
+    fn directives_own_their_line() {
+        let p = parse("#if UNITY_EDITOR\nvoid A() { }\n#endif", &Signature::default());
+        assert_eq!(p.blocks.len(), 3);
+        assert_eq!(p.blocks[0].kind, BlockKind::Directive);
+        assert_eq!(p.blocks[0].head, "#if UNITY_EDITOR");
+        assert_eq!(p.blocks[1].head, "void A");
+        assert_eq!(p.blocks[2].kind, BlockKind::Directive);
+    }
+
+    #[test]
+    fn case_labels_do_not_become_return_types() {
+        let src = "switch (k) { case A: Draw(x); break; default: Stop(); }";
+        let p = parse(src, &Signature::default());
+        let sw = find(&p.blocks, "switch").expect("switch");
+        let heads: Vec<&str> = sw.children.iter().map(|b| b.head.as_str()).collect();
+        assert_eq!(heads, vec!["case A", "Draw(x)", "break", "default", "Stop()"]);
+        assert!(sw.children.iter().all(|b| b.kind != BlockKind::Method), "no fake signature");
     }
 
     #[test]
