@@ -25,7 +25,17 @@ pub fn context_strip(ui: &mut egui::Ui, ctx: &IdeContext) {
         if crumb.is_empty() {
             ui.weak("(no IDE context)");
         } else {
-            ui.label(RichText::new(crumb).monospace().size(11.5).color(Color32::from_rgb(148, 163, 184)));
+            // Truncate rather than run under the right-hand status on a narrow
+            // window (the pop-out is 1100 px and the breadcrumb is long).
+            ui.add(
+                egui::Label::new(
+                    RichText::new(crumb)
+                        .monospace()
+                        .size(11.5)
+                        .color(Color32::from_rgb(148, 163, 184)),
+                )
+                .truncate(),
+            );
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(
